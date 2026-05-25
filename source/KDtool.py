@@ -1487,7 +1487,7 @@ def show_loading_gui():
     except:
         checked = False
         password_ok = False
-    splash_version = "260526"
+    splash_version = "260527"
 
     root = tk.Tk()
     _icon_path = os.path.join(_exe_dir, "KDtool.ico")
@@ -1875,7 +1875,7 @@ def add_kasse_ordner_row(parent, folder_path):
 
 def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse_install_datum,
               kasse_ordner, arbeitsstationen, last_windows_update, boot_time, uptime_str, tv_id, anydesk_id,
-              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260526"):
+              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260527"):
     global app_running
 
     root.title(f"KDtool v{version_str} - Keller & Dürr Kassensysteme AG")

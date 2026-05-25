@@ -1487,7 +1487,7 @@ def show_loading_gui():
     except:
         checked = False
         password_ok = False
-    splash_version = "260525"
+    splash_version = "260526"
 
     root = tk.Tk()
     _icon_path = os.path.join(_exe_dir, "KDtool.ico")
@@ -1875,7 +1875,7 @@ def add_kasse_ordner_row(parent, folder_path):
 
 def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse_install_datum,
               kasse_ordner, arbeitsstationen, last_windows_update, boot_time, uptime_str, tv_id, anydesk_id,
-              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260525"):
+              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260526"):
     global app_running
 
     root.title(f"KDtool v{version_str} - Keller & Dürr Kassensysteme AG")
@@ -3921,7 +3921,10 @@ Start-Sleep -Seconds 2.5
 
     update_status = tk.Label(left_col, text="", font=("Segoe UI", 9), fg="#555555", bg="white", anchor="w")
 
-    default_base = "https://www.keller-duerr.ch/kdtool"
+    update_sources = [
+        ("https://raw.githubusercontent.com/soendi/KDtool/main", "KDtool.exe"),
+        ("https://www.keller-duerr.ch/kdtool", "kdtool.exe"),
+    ]
 
     def _try_fetch(url):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -3940,17 +3943,18 @@ Start-Sleep -Seconds 2.5
             custom = update_url_entry.get().strip()
             if custom and not custom.startswith("http://") and not custom.startswith("https://") and not custom.startswith("file://"):
                 custom = "file:///" + custom.replace("\\", "/").lstrip("/")
-            bases = [b for b in (custom, default_base) if b]
-            for base in bases:
+            bases = [(custom, "KDtool.exe")] if custom else []
+            bases += update_sources
+            for base, exe_name in bases:
                 try:
                     base = base.rstrip("/")
                     latest = _try_fetch(f"{base}/version.txt")
                     if int(latest) > int(version_str):
-                        def confirm_and_update(b=base, v=latest):
+                        def confirm_and_update(b=base, exe=exe_name, v=latest):
                             if not messagebox.askyesno("Update verfügbar", f"Version {v} ist verfügbar.\nJetzt herunterladen und installieren?"):
                                 return
                             update_status.config(text="Lade Update herunter …", fg="#555555")
-                            threading.Thread(target=perform_update, args=(v, f"{b}/kdtool.exe"), daemon=True).start()
+                            threading.Thread(target=perform_update, args=(v, f"{b}/{exe}"), daemon=True).start()
                         root.after(0, lambda: [
                             update_status.config(text=f"Version {latest} verfügbar!", fg="#28a745"),
                             info_update_btn.config(text="Jetzt aktualisieren", command=confirm_and_update, state="normal")
@@ -4156,23 +4160,24 @@ Start-Sleep -Seconds 2.5
 
     def _check_startup_update():
         sources = [
-            ("https://www.keller-duerr.ch/kdtool", True),
-            ("C:\\Users\\sonde\\Desktop", False),
+            ("https://raw.githubusercontent.com/soendi/KDtool/main", True, "KDtool.exe"),
+            ("https://www.keller-duerr.ch/kdtool", True, "kdtool.exe"),
+            ("C:\\Users\\sonde\\Desktop", False, "KDtool.exe"),
         ]
-        for base, is_remote in sources:
+        for base, is_remote, exe_name in sources:
             try:
                 if is_remote:
                     req = urllib.request.Request(f"{base}/version.txt", headers={"User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         latest = resp.read().decode("utf-8").strip()
-                    dl_url = f"{base}/kdtool.exe"
+                    dl_url = f"{base}/{exe_name}"
                 else:
                     vp = os.path.join(base, "version.txt")
                     if not os.path.isfile(vp):
                         continue
                     with open(vp) as f:
                         latest = f.read().strip()
-                    dl_url = "file:///" + os.path.join(base, "KDtool.exe").replace("\\", "/")
+                    dl_url = "file:///" + os.path.join(base, exe_name).replace("\\", "/")
                 if int(latest) > int(version_str):
                     root.after(0, lambda v=latest, u=dl_url: (
                         messagebox.showinfo("Update gefunden", "Update gefunden, das Update wird automatisch installiert."),

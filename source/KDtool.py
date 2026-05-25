@@ -3624,7 +3624,8 @@ Start-Sleep -Seconds 2.5
     cb_display = [name for name, _ in email_recipients]
     cb_style = ttk.Style()
     cb_style.configure("Tall.TCombobox", font=("Segoe UI", 14), padding=(4, 6))
-    recipient_cb = ttk.Combobox(cb_row, values=cb_display, width=58, font=("Segoe UI", 14), state="readonly", style="Tall.TCombobox")
+    cb_style.configure("Tall.TCombobox.Listbox", font=("Segoe UI", 14))
+    recipient_cb = ttk.Combobox(cb_row, values=cb_display, width=42, font=("Segoe UI", 14), state="readonly", style="Tall.TCombobox")
     recipient_cb.pack(side="left", padx=8)
     recipient_cb.bind("<<ComboboxSelected>>", _on_recipient_select)
     recipient_cb.set("Keller & Dürr allgemein")

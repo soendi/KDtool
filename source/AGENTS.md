@@ -11,7 +11,6 @@ py -3.14 -m PyInstaller --onefile --noconsole --icon=KDtool.ico --add-data "KDto
 - `KDtool.exe` aus `dist\` in Projektordner kopieren
 - `version.txt` im Projektordner erstellen mit Inhalt = `splash_version` aus `source\KDtool.py`
 - `KDtool.exe` kopieren nach:
-  - `C:\Users\sonde\Desktop\KDtool.exe`
   - `G:\Meine Ablage\Arbeit\Firmen\07 Keller Duerr\KDtool\KDtool.exe`
 - `version.txt` kopieren nach:
   - `G:\Meine Ablage\Arbeit\Firmen\07 Keller Duerr\KDtool\version.txt`

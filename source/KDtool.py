@@ -3606,7 +3606,7 @@ Start-Sleep -Seconds 2.5
         ("Daniel Büchel", "d.buechel@keller-duerr.ch"),
         ("Andreas Büchel", "a.buechel@keller-duerr.ch"),
         ("Alexander Baumgartner", "a.baumgartner@keller-duerr.ch"),
-        ("Lukas Sonderegger", "sondereggerlukas@gmail.com"),
+        ("Lukas Sonderegger", "l.sonderegger@keller-duerr.ch"),
     ]
 
     def _on_recipient_select(event):
@@ -3622,7 +3622,9 @@ Start-Sleep -Seconds 2.5
     tk.Label(cb_row, text="Empfänger wählen", width=16, anchor="w", bg="white", fg="#444444",
              font=("Segoe UI", 10)).pack(side="left")
     cb_display = [name for name, _ in email_recipients]
-    recipient_cb = ttk.Combobox(cb_row, values=cb_display, width=58, font=("Segoe UI", 10))
+    cb_style = ttk.Style()
+    cb_style.configure("Tall.TCombobox", font=("Segoe UI", 14), padding=(4, 6))
+    recipient_cb = ttk.Combobox(cb_row, values=cb_display, width=58, font=("Segoe UI", 14), state="readonly", style="Tall.TCombobox")
     recipient_cb.pack(side="left", padx=8)
     recipient_cb.bind("<<ComboboxSelected>>", _on_recipient_select)
     recipient_cb.set("Keller & Dürr allgemein")

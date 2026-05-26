@@ -4241,34 +4241,44 @@ Start-Sleep -Seconds 2.5
     slide_in(root, 1380, 1000)
     set_titlebar_style(root)
 
+    update_status_bar = tk.Label(bottom_bar, text="", font=("Segoe UI", 9), fg="#555555", bg="#f0f0f0")
+    update_status_bar.pack(side="right", padx=10)
+
     def _check_startup_update():
-        sources = [
-            ("https://raw.githubusercontent.com/soendi/KDtool/main", True, "KDtool.exe"),
-            ("https://www.keller-duerr.ch/kdtool", True, "kdtool.exe"),
-            ("C:\\Users\\sonde\\Desktop", False, "KDtool.exe"),
-        ]
-        for base, is_remote, exe_name in sources:
-            try:
-                if is_remote:
-                    req = urllib.request.Request(f"{base}/version.txt", headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        latest = resp.read().decode("utf-8").strip()
-                    dl_url = f"{base}/{exe_name}"
-                else:
-                    vp = os.path.join(base, "version.txt")
-                    if not os.path.isfile(vp):
-                        continue
-                    with open(vp) as f:
-                        latest = f.read().strip()
-                    dl_url = "file:///" + os.path.join(base, exe_name).replace("\\", "/")
-                if int(latest) > int(version_str):
-                    root.after(0, lambda v=latest, u=dl_url: (
-                        messagebox.showinfo("Update gefunden", "Update gefunden, das Update wird automatisch installiert."),
-                        threading.Thread(target=perform_update, args=(v, u), daemon=True).start()
-                    ))
+        update_status_bar.config(text="Prüfe auf Updates …")
+        def worker():
+            sources = [
+                ("https://raw.githubusercontent.com/soendi/KDtool/main", True, "KDtool.exe"),
+                ("https://www.keller-duerr.ch/kdtool", True, "kdtool.exe"),
+                ("C:\\Users\\sonde\\Desktop", False, "KDtool.exe"),
+            ]
+            for base, is_remote, exe_name in sources:
+                try:
+                    if is_remote:
+                        req = urllib.request.Request(f"{base}/version.txt", headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            latest = resp.read().decode("utf-8").strip()
+                        dl_url = f"{base}/{exe_name}"
+                    else:
+                        vp = os.path.join(base, "version.txt")
+                        if not os.path.isfile(vp):
+                            continue
+                        with open(vp) as f:
+                            latest = f.read().strip()
+                        dl_url = "file:///" + os.path.join(base, exe_name).replace("\\", "/")
+                    if int(latest) > int(version_str):
+                        root.after(0, lambda v=latest, u=dl_url: (
+                            update_status_bar.config(text=""),
+                            messagebox.showinfo("Update gefunden", "Update gefunden, das Update wird automatisch installiert."),
+                            threading.Thread(target=perform_update, args=(v, u), daemon=True).start()
+                        ))
+                        return
+                    root.after(0, lambda: update_status_bar.config(text=""))
                     return
-            except:
-                continue
+                except:
+                    continue
+            root.after(0, lambda: update_status_bar.config(text=""))
+        threading.Thread(target=worker, daemon=True).start()
 
     root.after(500, _check_startup_update)
 

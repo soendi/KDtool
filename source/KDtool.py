@@ -4153,16 +4153,18 @@ Start-Sleep -Seconds 2.5
                     "https://raw.githubusercontent.com/soendi/KDtool/main/version.txt",
                     headers={"User-Agent": "Mozilla/5.0"},
                 )
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=15) as resp:
                     latest = resp.read().decode("utf-8").strip()
                 dl_url = "https://raw.githubusercontent.com/soendi/KDtool/main/KDtool.exe"
-                root.after(0, lambda: (
-                    reinstall_status.config(text=f"Lade Version {latest} herunter …", fg="#555555"),
-                    threading.Thread(target=perform_update, args=(latest, dl_url), daemon=True).start()
-                ))
+                temp_dir = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "kd-update")
+                os.makedirs(temp_dir, exist_ok=True)
+                dl_path = os.path.join(temp_dir, "KDtool_new.exe")
+                _try_download(dl_url, dl_path)
+                current = os.path.abspath(sys.argv[0])
+                _launch_update(dl_path, current, latest, reinstall_status)
             except Exception as exc:
                 root.after(0, lambda: reinstall_status.config(
-                    text=f"❌ Fehler beim Herunterladen: {exc}", fg="red"))
+                    text=f"❌ Fehler: {benutzer_fehlermeldung(exc)}", fg="red"))
 
     tk.Button(left_col, text="Version erneut herunterladen", font=("Segoe UI", 10), bg="#0078d4", fg="white",
               relief="flat", padx=12, pady=4, command=_reinstall_version,

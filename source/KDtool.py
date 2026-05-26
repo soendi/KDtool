@@ -2081,7 +2081,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
     for hint_line in [
         "Hinweis: Für fixe IP sind IP, Subnetz, Gateway und DNS1 Pflicht. Subnetz als 255.255.255.0 oder 24.",
         "Die Eingabefelder bleiben bei Umschaltungen unverändert.",
-        "„Einstellungen zurücksetzen“ stellt die zuletzt gesicherte Konfiguration wieder her.",
+        "„Einstellungen zurücksetzen“ stellt die ursprüngliche Konfiguration wieder her, die beim Start des Programms geladen wurde.",
     ]:
         tk.Label(
             right_col,

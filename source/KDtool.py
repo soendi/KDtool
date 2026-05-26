@@ -1487,7 +1487,7 @@ def show_loading_gui():
     except:
         checked = False
         password_ok = False
-    splash_version = "260528"
+    splash_version = "260529"
 
     root = tk.Tk()
     _icon_path = os.path.join(_exe_dir, "KDtool.ico")
@@ -1875,7 +1875,7 @@ def add_kasse_ordner_row(parent, folder_path):
 
 def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse_install_datum,
               kasse_ordner, arbeitsstationen, last_windows_update, boot_time, uptime_str, tv_id, anydesk_id,
-              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260528"):
+              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260529"):
     global app_running
 
     root.title(f"KDtool v{version_str} - Keller & Dürr Kassensysteme AG")
@@ -1902,11 +1902,13 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
     _tab_buttons = {}
     _tab_active = None
     _vlan_scan_complete = [False]
+    _printer_scan_complete = [False]
     _tab_col = [0]
     _tab_busy = set()
     _cur_net = net
     _cur_dhcp = dhcp
     _cur_kasse_ordner = kasse_ordner
+    _cur_kasse_ws = [arbeitsstationen]
     _cur_kasse_firma_data = kasse_firma_data
     _cur_tv_id = tv_id
     _cur_anydesk_id = anydesk_id
@@ -1925,7 +1927,9 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
                 return "#EF9A9A"
             return "#FFE0B2" if not _vlan_scan_complete[0] else "#C8E6C9"
         if name == "Drucker":
-            return "#C8E6C9"
+            if not _printer_scan_complete[0]:
+                return "#FFE0B2"
+            return "#EF9A9A" if tree.tag_has("fehler") else "#C8E6C9"
         if name == "Windows":
             return "#C8E6C9"
         if name == "Internet":
@@ -1940,7 +1944,12 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
             found = bool(cur_tv_id or cur_ad_id)
             return "#C8E6C9" if found else "#FFE0B2"
         if name == "Kasse":
-            return "#C8E6C9" if _cur_kasse_ordner else "#FFE0B2"
+            if not _cur_kasse_ordner:
+                return "#EF9A9A"
+            ws = _cur_kasse_ws[0]
+            if not ws or "Keine" in ws:
+                return "#EF9A9A"
+            return "#C8E6C9"
         if name == "Daten übermitteln":
             txt = internet_label.cget("text")
             if "OK" not in txt:
@@ -2420,12 +2429,15 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
             pass
 
     def _refresh_printers():
+        _printer_scan_complete[0] = False
+        _update_tab_colors()
         for item in tree.get_children():
             tree.delete(item)
         for name, ip, job_count, err_flag in get_printers():
             err_txt = "Fehler" if err_flag == "1" else "OK"
             tree.insert("", "end", values=(name, ip, job_count, err_txt),
                         tags=("fehler",) if err_flag == "1" else ())
+        _printer_scan_complete[0] = True
         _update_tab_colors()
 
     add_section_title(t3, "Drucker", top_padding=20, on_refresh=_refresh_printers)
@@ -2442,6 +2454,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
         err_txt = "Fehler" if err_flag == "1" else "OK"
         tree.insert("", "end", values=(name, ip, job_count, err_txt),
                     tags=("fehler",) if err_flag == "1" else ())
+    _printer_scan_complete[0] = True
 
     tree.bind("<Double-1>", lambda e: _open_printer_props(
         tree.item(tree.selection()[0], "values")[0]
@@ -2711,6 +2724,33 @@ Start-Sleep -Seconds 2.5
         on_scan_done=on_scan_done,
     )
 
+    ip_renew_bottom = tk.Frame(t4, bg="white")
+    ip_renew_bottom.pack(fill="x", padx=20, pady=(5, 10))
+    ip_renew_right = tk.Frame(ip_renew_bottom, bg="white")
+    ip_renew_right.pack(side="right")
+
+    def _renew_ip():
+        def worker():
+            ip_renew_status.config(text="⏳ IP-Adresse wird erneuert ...", fg="#666666")
+            try:
+                subprocess.run(["ipconfig", "/release"], capture_output=True, **_subprocess_kwargs())
+                subprocess.run(["ipconfig", "/renew"], capture_output=True, **_subprocess_kwargs())
+                ip_renew_status.config(text="✅ IP-Adresse erneuert", fg="#28a745")
+                _refresh_vlan_scan()
+            except Exception as e:
+                ip_renew_status.config(text=f"❌ Fehler: {e}", fg="#d32f2f")
+        threading.Thread(target=worker, daemon=True).start()
+
+    tk.Button(
+        ip_renew_right, text="IP Adresse erneuern",
+        bg="#0078d4", fg="white",
+        font=("Segoe UI", 11, "bold"),
+        relief="flat", padx=16, pady=6,
+        command=_renew_ip,
+    ).pack(anchor="e")
+    ip_renew_status = tk.Label(ip_renew_right, text="", font=("Segoe UI", 10), bg="white", anchor="e")
+    ip_renew_status.pack(anchor="e", pady=(2, 0))
+
     def run_network_change(action):
         message = action()
         show_status(message)
@@ -2784,6 +2824,7 @@ Start-Sleep -Seconds 2.5
         ordner_label.config(text=new_ordner if new_ordner else "Nicht gefunden")
         ws_label.config(text=new_ws)
         _cur_kasse_ordner = new_ordner
+        _cur_kasse_ws[0] = new_ws
         new_firma, _ = extract_firma_data(new_ordner)
         _cur_kasse_firma_data = new_firma
         if new_firma:
@@ -3609,8 +3650,8 @@ Start-Sleep -Seconds 2.5
         ("Lukas Sonderegger", "l.sonderegger@keller-duerr.ch"),
     ]
 
-    def _on_recipient_select(event):
-        sel = recipient_cb.get()
+    def _on_cb_select(*args):
+        sel = cb_var.get()
         for name, email in email_recipients:
             if sel == name:
                 smtp_to.delete(0, tk.END)
@@ -3622,13 +3663,12 @@ Start-Sleep -Seconds 2.5
     tk.Label(cb_row, text="Empfänger wählen", width=16, anchor="w", bg="white", fg="#444444",
              font=("Segoe UI", 10)).pack(side="left")
     cb_display = [name for name, _ in email_recipients]
-    cb_style = ttk.Style()
-    cb_style.configure("Tall.TCombobox", font=("Segoe UI", 14), padding=(4, 6))
-    cb_style.configure("Tall.TCombobox.Listbox", font=("Segoe UI", 14))
-    recipient_cb = ttk.Combobox(cb_row, values=cb_display, width=42, font=("Segoe UI", 14), state="readonly", style="Tall.TCombobox")
+    cb_var = tk.StringVar(value="Keller & Dürr allgemein")
+    cb_var.trace_add("write", _on_cb_select)
+    recipient_cb = tk.OptionMenu(cb_row, cb_var, *cb_display)
+    recipient_cb.config(width=40, font=("Segoe UI", 14), bg="white", fg="#333333", activebackground="#0078d4", activeforeground="white", bd=1, relief="solid", anchor="w")
+    recipient_cb["menu"].config(font=("Segoe UI", 14), bg="white", fg="#333333", activebackground="#0078d4", activeforeground="white")
     recipient_cb.pack(side="left", padx=8)
-    recipient_cb.bind("<<ComboboxSelected>>", _on_recipient_select)
-    recipient_cb.set("Keller & Dürr allgemein")
 
     smtp_to = add_email_row(scroll_frame, "Empfänger", default="office@keller-duerr.ch")
     if not password_ok:

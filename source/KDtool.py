@@ -933,11 +933,12 @@ def extract_firma_data(kasse_ordner):
     sql_files = [f for f in os.listdir(psql_dir) if f.lower().endswith(".sql")]
     if not sql_files:
         return None, "Keine SQL-Dateien gefunden."
+    sql_files.sort(key=lambda f: os.path.getsize(os.path.join(psql_dir, f)), reverse=True)
 
     target_cols = ["faort", "fabetrieb", "fafirmaadresse", "fafirmaplz",
                    "falocationname", "falocationadresse", "falocationplz", "falocationort"]
 
-    for sql_file in sorted(sql_files):
+    for sql_file in sql_files:
         sql_path = os.path.join(psql_dir, sql_file)
         temp_out = os.path.join(os.environ.get("TEMP", "."), f"kd_kafasql_{os.getpid()}.sql")
         try:
@@ -957,9 +958,17 @@ def extract_firma_data(kasse_ordner):
             with open(src, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
-            idx = content.find("COPY x3000demo.kafasql (")
+            idx = content.find("COPY x3000.kafasql (")
             if idx < 0:
-                idx = content.find("COPY public.kafasql (")
+                idx = content.find("COPY x3000demo.kafasql (")
+            if idx < 0:
+                idx = content.find("kafasql (")
+                if idx >= 0:
+                    copy_start = content.rfind("COPY ", 0, idx)
+                    if copy_start >= 0:
+                        idx = copy_start
+                    else:
+                        idx = -1
             if idx < 0:
                 continue
 
@@ -2034,7 +2043,11 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
         def worker():
             new_net = get_network()
             new_dhcp = get_dhcp_status()
-            root.after(0, lambda: apply_network_data(new_net, new_dhcp))
+            root.after(0, lambda: (
+                apply_network_data(new_net, new_dhcp),
+                info_labels["PC Name"].config(text=platform.node()),
+                _refresh_firewall(),
+            ))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2340,7 +2353,15 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
 
     t2 = ttk.Frame(tabs)
 
-    def refresh_users_list():
+    def refresh_windows_data():
+        new_windows = windows_info()
+        new_update = get_last_windows_update()
+        new_boot, new_uptime = get_uptime_str()
+        win_pc_label.config(text=new_windows["PC Name"])
+        win_sys_label.config(text=f"Windows {new_windows['Release']}")
+        win_ver_label.config(text=new_windows["Version"])
+        win_update_label.config(text=new_update)
+        win_uptime_label.config(text=f"{new_boot} Uhr (Betriebszeit: {new_uptime})")
         for w in users_frame.winfo_children():
             w.destroy()
         try:
@@ -2352,18 +2373,18 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
         except Exception:
             tk.Label(users_frame, text="  (Fehler beim Abrufen der Benutzer)", anchor="w", bg="white", fg="#999", font=("Segoe UI", 10)).pack(fill="x")
 
-    add_section_title(t2, "Windows", top_padding=20, on_refresh=refresh_users_list)
-    add_info_row(t2, "PC Name", windows["PC Name"], label_width=20)
-    add_info_row(t2, "System", f"Windows {windows['Release']}", label_width=20)
-    add_info_row(t2, "Version", windows["Version"], label_width=20)
+    add_section_title(t2, "Windows", top_padding=20, on_refresh=refresh_windows_data)
+    win_pc_label = add_info_row(t2, "PC Name", windows["PC Name"], label_width=20)
+    win_sys_label = add_info_row(t2, "System", f"Windows {windows['Release']}", label_width=20)
+    win_ver_label = add_info_row(t2, "Version", windows["Version"], label_width=20)
     add_info_row(t2, "KDtool Version", version_str, label_width=20)
-    add_info_row(t2, "Letztes Update am", last_windows_update, label_width=20)
-    add_info_row(t2, "Letzter Neustart", f"{boot_time} Uhr (Betriebszeit: {uptime_str})", label_width=20)
+    win_update_label = add_info_row(t2, "Letztes Update am", last_windows_update, label_width=20)
+    win_uptime_label = add_info_row(t2, "Letzter Neustart", f"{boot_time} Uhr (Betriebszeit: {uptime_str})", label_width=20)
 
     add_section_title(t2, "Benutzer", top_padding=20)
     users_frame = tk.Frame(t2, bg="white")
     users_frame.pack(fill="x", padx=30, pady=(0, 5))
-    refresh_users_list()
+    refresh_windows_data()
 
     def create_user01():
         ps = r"""
@@ -2381,7 +2402,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
             result = run_powershell(ps, bypass_policy=True).strip()
             if result == "ERFOLG":
                 user_status_label.config(text="✅ Benutzer User01 wurde angelegt und den Administratoren hinzugefügt.", fg="#28a745")
-                refresh_users_list()
+                refresh_windows_data()
             else:
                 user_status_label.config(text="ℹ️ Benutzer User01 existiert bereits.", fg="#d32f2f")
         except Exception:
@@ -3639,6 +3660,24 @@ Start-Sleep -Seconds 2.5
         new_subject = f"PC-Informationen / {f_parts} / {pc_name}, {datum}" if f_parts else f"PC-Informationen / {pc_name}, {datum}"
         smtp_subject.delete(0, tk.END)
         smtp_subject.insert(0, new_subject)
+        defaults = {
+            smtp_server: "asmtp.mail.hostpoint.ch",
+            smtp_port: "465",
+            smtp_user: "mailservice@keller-duerr.ch",
+            smtp_from: "mailservice@keller-duerr.ch",
+        }
+        for field, val in defaults.items():
+            if isinstance(field, tk.Entry):
+                field.delete(0, tk.END)
+                field.insert(0, val)
+            else:
+                field.set(val)
+        if isinstance(smtp_pass, tk.Entry):
+            smtp_pass.delete(0, tk.END)
+            smtp_pass.insert(0, "kasseX3000kd")
+        else:
+            smtp_pass.set("kasseX3000kd")
+        enc_var.set("ssl")
 
     add_section_title(scroll_frame, "E-Mail Versand", top_padding=20, on_refresh=_refresh_email_subject)
 
@@ -3696,11 +3735,11 @@ Start-Sleep -Seconds 2.5
                    bg="white", font=("Segoe UI", 10)).pack(side="left")
 
     if password_ok:
-        smtp_server = add_email_row(scroll_frame, "SMTP Server", default="smtp.mail.ch")
+        smtp_server = add_email_row(scroll_frame, "SMTP Server", default="asmtp.mail.hostpoint.ch")
         smtp_port = add_email_row(scroll_frame, "Port", default="465")
-        smtp_user = add_email_row(scroll_frame, "Benutzername", default="homeassistant@mail.ch")
-        smtp_pass = add_email_row(scroll_frame, "Passwort", show="\u25CF", default="ASaeimPa1-2J.Ds$.")
-        smtp_from = add_email_row(scroll_frame, "Absender", default="homeassistant@mail.ch")
+        smtp_user = add_email_row(scroll_frame, "Benutzername", default="mailservice@keller-duerr.ch")
+        smtp_pass = add_email_row(scroll_frame, "Passwort", show="\u25CF", default="kasseX3000kd")
+        smtp_from = add_email_row(scroll_frame, "Absender", default="mailservice@keller-duerr.ch")
 
         enc_row = tk.Frame(scroll_frame, bg="white")
         enc_row.pack(fill="x", padx=30, pady=5)
@@ -3711,11 +3750,11 @@ Start-Sleep -Seconds 2.5
             tk.Radiobutton(enc_row, text=txt, variable=enc_var, value=val, bg="white",
                            font=("Segoe UI", 10)).pack(side="left", padx=(0, 15))
     else:
-        smtp_server = tk.StringVar(value="smtp.mail.ch")
+        smtp_server = tk.StringVar(value="asmtp.mail.hostpoint.ch")
         smtp_port = tk.StringVar(value="465")
-        smtp_user = tk.StringVar(value="homeassistant@mail.ch")
-        smtp_pass = tk.StringVar(value="ASaeimPa1-2J.Ds$.")
-        smtp_from = tk.StringVar(value="homeassistant@mail.ch")
+        smtp_user = tk.StringVar(value="mailservice@keller-duerr.ch")
+        smtp_pass = tk.StringVar(value="kasseX3000kd")
+        smtp_from = tk.StringVar(value="mailservice@keller-duerr.ch")
         enc_var = tk.StringVar(value="ssl")
 
     email_status = tk.Label(scroll_frame, text="", font=("Segoe UI", 10), fg="#333333", bg="white", anchor="w",
@@ -4152,6 +4191,7 @@ Start-Sleep -Seconds 2.5
 
         tk.Button(t_hosts, text="Hosts speichern", bg="#0078d4", fg="white",
                   font=("Segoe UI", 11, "bold"), relief="flat", padx=16, pady=6,
+                  state="normal" if is_admin() else "disabled",
                   command=save_hosts).pack(anchor="e", padx=20, pady=(10, 2))
         hosts_status = tk.Label(t_hosts, text="", font=("Segoe UI", 10), bg="white", anchor="e")
         hosts_status.pack(anchor="e", padx=20, pady=(0, 10))

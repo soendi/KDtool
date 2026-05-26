@@ -4141,6 +4141,33 @@ Start-Sleep -Seconds 2.5
               relief="flat", padx=12, pady=4, command=select_zip,
               ).pack(anchor="w", pady=(8, 0))
 
+    reinstall_status = tk.Label(left_col, text="", font=("Segoe UI", 9), fg="#555555", bg="white", anchor="w")
+
+    def _reinstall_version():
+        reinstall_status.pack(anchor="w", pady=(6, 0))
+        reinstall_status.config(text="Lade Version herunter …", fg="#555555")
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    "https://raw.githubusercontent.com/soendi/KDtool/main/version.txt",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    latest = resp.read().decode("utf-8").strip()
+                dl_url = "https://raw.githubusercontent.com/soendi/KDtool/main/KDtool.exe"
+                root.after(0, lambda: (
+                    reinstall_status.config(text=f"Lade Version {latest} herunter …", fg="#555555"),
+                    threading.Thread(target=perform_update, args=(latest, dl_url), daemon=True).start()
+                ))
+            except Exception as exc:
+                root.after(0, lambda: reinstall_status.config(
+                    text=f"❌ Fehler beim Herunterladen: {exc}", fg="red"))
+
+    tk.Button(left_col, text="Version erneut herunterladen", font=("Segoe UI", 10), bg="#0078d4", fg="white",
+              relief="flat", padx=12, pady=4, command=_reinstall_version,
+              ).pack(anchor="w", pady=(8, 0))
+
     # Tab-Reihenfolge festlegen
     _add_tab(t1, text="Netzwerkeinstellungen")
     _add_tab(t4, text="Netzwerkgeräte")
@@ -4241,11 +4268,11 @@ Start-Sleep -Seconds 2.5
     slide_in(root, 1380, 1000)
     set_titlebar_style(root)
 
-    update_status_bar = tk.Label(bottom_bar, text="", font=("Segoe UI", 9), fg="#555555", bg="#f0f0f0")
+    update_status_bar = tk.Label(bottom_bar, text="", font=("Segoe UI", 9, "bold"), fg="#555555", bg="white")
     update_status_bar.pack(side="right", padx=10)
 
     def _check_startup_update():
-        update_status_bar.config(text="Prüfe auf Updates …")
+        update_status_bar.config(text="Prüfe auf Updates …", fg="#555555")
         def worker():
             sources = [
                 ("https://raw.githubusercontent.com/soendi/KDtool/main", True, "KDtool.exe"),
@@ -4268,16 +4295,16 @@ Start-Sleep -Seconds 2.5
                         dl_url = "file:///" + os.path.join(base, exe_name).replace("\\", "/")
                     if int(latest) > int(version_str):
                         root.after(0, lambda v=latest, u=dl_url: (
-                            update_status_bar.config(text=""),
+                            update_status_bar.config(text="⚠ Update verfügbar", fg="red"),
                             messagebox.showinfo("Update gefunden", "Update gefunden, das Update wird automatisch installiert."),
                             threading.Thread(target=perform_update, args=(v, u), daemon=True).start()
                         ))
                         return
-                    root.after(0, lambda: update_status_bar.config(text=""))
+                    root.after(0, lambda: update_status_bar.config(text="✓ Version aktuell", fg="green"))
                     return
                 except:
                     continue
-            root.after(0, lambda: update_status_bar.config(text=""))
+            root.after(0, lambda: update_status_bar.config(text="✗ Update-Prüfung fehlgeschlagen", fg="red"))
         threading.Thread(target=worker, daemon=True).start()
 
     root.after(500, _check_startup_update)

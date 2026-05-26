@@ -4059,12 +4059,14 @@ Start-Sleep -Seconds 2.5
             os.remove(bak_path)
         except:
             pass
-        kernel32.MoveFileW(current, bak_path)
+        if not kernel32.MoveFileW(current, bak_path):
+            raise RuntimeError(f"Konnte '{current}' nicht verschieben. Bitte Programm als Administrator starten.")
         try:
             import shutil
             shutil.copy2(dl_path, current)
         except Exception:
             shutil.copy2(bak_path, current)
+            raise
         root.after(0, lambda: (messagebox.showinfo("Update erfolgreich", "Update erfolgreich, bitte das Programm neu starten."), root.destroy()))
 
     def perform_update(latest, download_url):
@@ -4145,23 +4147,17 @@ Start-Sleep -Seconds 2.5
 
     def _reinstall_version():
         reinstall_status.pack(anchor="w", pady=(6, 0))
-        reinstall_status.config(text="Lade Version herunter …", fg="#555555")
+        reinstall_status.config(text="Lade EXE von GitHub …", fg="#555555")
 
         def worker():
             try:
-                req = urllib.request.Request(
-                    "https://raw.githubusercontent.com/soendi/KDtool/main/version.txt",
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    latest = resp.read().decode("utf-8").strip()
                 dl_url = "https://raw.githubusercontent.com/soendi/KDtool/main/KDtool.exe"
                 temp_dir = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"), "kd-update")
                 os.makedirs(temp_dir, exist_ok=True)
                 dl_path = os.path.join(temp_dir, "KDtool_new.exe")
                 _try_download(dl_url, dl_path)
                 current = os.path.abspath(sys.argv[0])
-                _launch_update(dl_path, current, latest, reinstall_status)
+                _launch_update(dl_path, current, version_str, reinstall_status)
             except Exception as exc:
                 root.after(0, lambda: reinstall_status.config(
                     text=f"❌ Fehler: {benutzer_fehlermeldung(exc)}", fg="red"))

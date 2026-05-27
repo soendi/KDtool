@@ -724,7 +724,7 @@ def _nmap_xml_scan(targets):
         r = subprocess.run(
             ["nmap", "-sn", "-R", "-oX", "-"] + targets,
             capture_output=True, text=True, encoding="utf-8", errors="ignore",
-            timeout=30, **_subprocess_kwargs(),
+            timeout=45, **_subprocess_kwargs(),
         )
         if r.returncode != 0:
             return None
@@ -816,22 +816,50 @@ def load_vlan(primary_tree, extended_tree, root, ip, extended_list, progress_lab
         if nmap_results is not None:
             alive = set()
             own_ip = ip
-            for entry in nmap_results:
-                alive.add(entry[0])
-            if not alive:
-                alive.add(own_ip)
+            own_ips = {ip} | {e[0] for e in extended_list}
             entries = {}
+            # Nmap-Ergebnisse übernehmen
             for entry in nmap_results:
                 ip_a, name, mac, vendor = entry
+                ip_a = ip_a.strip()
                 is_primary = ".".join(ip_a.split(".")[:3]) == primary_base
-                if not name:
+                if ip_a in own_ips:
+                    name = socket.gethostname()
+                elif not name:
                     name = "-"
                 entries[ip_a] = (name, mac, vendor, is_primary)
-            if own_ip not in entries:
+                alive.add(ip_a)
+            # ARP-Tabelle als Ergänzung (findet Gateway, selbst wenn nmap ihn nicht sieht)
+            try:
+                r = subprocess.run(["arp", "-a"], capture_output=True, text=True, encoding="utf-8",
+                                   errors="ignore", timeout=5, **_subprocess_kwargs())
+                for line in r.stdout.splitlines():
+                    if "-" not in line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    ip_a = parts[0]
+                    mac_a = parts[1]
+                    if not is_ipv4_address(ip_a):
+                        continue
+                    a_base = ".".join(ip_a.split(".")[:3])
+                    if a_base not in bases or ip_a in entries:
+                        continue
+                    is_p = ".".join(ip_a.split(".")[:3]) == primary_base
+                    if ip_a in own_ips:
+                        e_name = socket.gethostname()
+                    else:
+                        e_name = "-"
+                    entries[ip_a] = (e_name, mac_a, "", is_p)
+            except:
+                pass
+            if not entries:
                 entries[own_ip] = (socket.gethostname(), "", "", True)
         else:
             alive = set()
             own_ip = ip
+            own_ips = {ip} | {e[0] for e in extended_list}
             try:
                 r = subprocess.run(["arp", "-a"], capture_output=True, text=True, encoding="utf-8",
                                    errors="ignore", timeout=5, **_subprocess_kwargs())
@@ -881,7 +909,7 @@ def load_vlan(primary_tree, extended_tree, root, ip, extended_list, progress_lab
             for ip_addr in sorted_ips:
                 name, mac, vendor, is_primary = entries[ip_addr]
                 tree = primary_tree if is_primary else extended_tree
-                tag = ("own",) if ip_addr == own_ip else ()
+                tag = ("own",) if ip_addr in own_ips else ()
                 tree.insert("", "end", values=(ip_addr, name, mac, vendor), tags=tag)
             primary_tree.tag_configure("own", background="#FFE0B2")
             extended_tree.tag_configure("own", background="#FFE0B2")
@@ -913,6 +941,7 @@ def _background_vlan_scan(ip, extended_list, nmap_ok=False):
             bases.add(".".join(ext_ip.split(".")[:3]))
 
         own_ip = ip
+        own_ips = {ip} | {e[0] for e in extended_list}
         nmap_results = None
         if nmap_ok:
             targets = []
@@ -924,18 +953,51 @@ def _background_vlan_scan(ip, extended_list, nmap_ok=False):
         entries_extended = []
 
         if nmap_results is not None:
+            nmap_ips = set()
             for entry in nmap_results:
                 ip_a, name, mac, vendor = entry
+                ip_a = ip_a.strip()
+                nmap_ips.add(ip_a)
                 is_primary = ".".join(ip_a.split(".")[:3]) == primary_base
-                if not name:
+                if ip_a in own_ips:
+                    name = socket.gethostname()
+                elif not name:
                     name = "-"
                 e = (ip_a, name, mac, vendor)
                 if is_primary:
                     entries_primary.append(e)
                 else:
                     entries_extended.append(e)
-            own_found = any(e[0] == own_ip for e in nmap_results)
-            if not own_found:
+            # ARP-Tabelle als Ergänzung
+            try:
+                r = subprocess.run(["arp", "-a"], capture_output=True, text=True, encoding="utf-8",
+                                   errors="ignore", timeout=5, **_subprocess_kwargs())
+                for line in r.stdout.splitlines():
+                    if "-" not in line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    ip_a = parts[0]
+                    mac_a = parts[1]
+                    if not is_ipv4_address(ip_a) or ip_a in nmap_ips:
+                        continue
+                    a_base = ".".join(ip_a.split(".")[:3])
+                    if a_base not in bases:
+                        continue
+                    is_p = ".".join(ip_a.split(".")[:3]) == primary_base
+                    if ip_a in own_ips:
+                        e_name = socket.gethostname()
+                    else:
+                        e_name = "-"
+                    e = (ip_a, e_name, mac_a, "")
+                    if is_p:
+                        entries_primary.append(e)
+                    else:
+                        entries_extended.append(e)
+            except:
+                pass
+            if not any(e[0] == own_ip for e in entries_primary + entries_extended):
                 entries_primary.insert(0, (own_ip, socket.gethostname(), "", ""))
         else:
             alive = set()
@@ -975,6 +1037,7 @@ def _background_vlan_scan(ip, extended_list, nmap_ok=False):
             "primary": entries_primary,
             "extended": entries_extended,
             "own_ip": own_ip,
+            "own_ips": own_ips,
         }
     except Exception:
         pass
@@ -3117,12 +3180,12 @@ Start-Sleep -Seconds 2.5
 
     global _vlan_scan_cache
     if _vlan_scan_cache is not None:
-        own_ip = _vlan_scan_cache["own_ip"]
+        own_ips = _vlan_scan_cache.get("own_ips", {_vlan_scan_cache["own_ip"]})
         for ip_addr, name, mac, vendor in _vlan_scan_cache["primary"]:
-            tag = ("own",) if ip_addr == own_ip else ()
+            tag = ("own",) if ip_addr in own_ips else ()
             tree2_primary.insert("", "end", values=(ip_addr, name, mac, vendor), tags=tag)
         for ip_addr, name, mac, vendor in _vlan_scan_cache["extended"]:
-            tag = ("own",) if ip_addr == own_ip else ()
+            tag = ("own",) if ip_addr in own_ips else ()
             tree2_extended.insert("", "end", values=(ip_addr, name, mac, vendor), tags=tag)
         tree2_primary.tag_configure("own", background="#FFE0B2")
         tree2_extended.tag_configure("own", background="#FFE0B2")

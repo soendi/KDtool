@@ -1745,7 +1745,7 @@ def center_window(window, width, height):
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
-def slide_in(window, width, height, speed=60, interval=5):
+def slide_in(window, width, height, speed=60, interval=5, on_done=None):
     screen_width = window.winfo_screenwidth()
     screen_height = window.winfo_screenheight()
     x = (screen_width - width) // 2
@@ -1760,6 +1760,8 @@ def slide_in(window, width, height, speed=60, interval=5):
     # Prüfen, ob wir bereits am Ziel sind
     if -height >= target_y:
         window.geometry(f"+{x}+{target_y}")
+        if on_done:
+            on_done()
         return
     state = {"y": -height}
 
@@ -1767,6 +1769,8 @@ def slide_in(window, width, height, speed=60, interval=5):
         state["y"] += speed
         if state["y"] >= target_y:
             window.geometry(f"+{x}+{target_y}")
+            if on_done:
+                on_done()
             return
         window.geometry(f"+{x}+{state['y']}")
         window.after(interval, animate)
@@ -1818,7 +1822,7 @@ def show_loading_gui():
     except:
         checked = False
         password_ok = False
-    splash_version = "260531"
+    splash_version = "260532"
 
     root = tk.Tk()
     _icon_path = os.path.join(_exe_dir, "KDtool.ico")
@@ -2061,7 +2065,156 @@ def show_loading_gui():
             nmap_ok=loaded["nmap"],
         ))
 
+    def _install_gui_with_monitor(proc, states, log_callback):
+        """Überwacht Fenster eines Installationsprozesses und sendet Enter bei bekannten Dialogen."""
+        try:
+            user32 = ctypes.windll.user32
+            EnumWindows = user32.EnumWindows
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+            GetWindowTextLengthW = user32.GetWindowTextLengthW
+            GetWindowTextW = user32.GetWindowTextW
+            GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+            IsWindowVisible = user32.IsWindowVisible
+
+            seen = set()
+            state_idx = [0]
+            skip_wait = [0.0]
+
+            def send_enter(hwnd, delay=0.1):
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(delay)
+                user32.keybd_event(0x0D, 0, 0, 0)
+                time.sleep(0.05)
+                user32.keybd_event(0x0D, 0, 2, 0)
+
+            def callback(hwnd, _):
+                try:
+                    if not IsWindowVisible(hwnd):
+                        return True
+                    if hwnd in seen:
+                        return True
+                    length = GetWindowTextLengthW(hwnd) + 1
+                    buf = ctypes.create_unicode_buffer(length)
+                    GetWindowTextW(hwnd, buf, length)
+                    title = buf.value.strip()
+                    if not title:
+                        return True
+                    if state_idx[0] < len(states):
+                        st = states[state_idx[0]]
+                        if st["match"] in title:
+                            if st["action"] == "enter":
+                                send_enter(hwnd, st.get("delay", 0.1))
+                                seen.add(hwnd)
+                            skip_wait[0] = time.time()
+                            state_idx[0] += 1
+                except:
+                    pass
+                return True
+
+            cb = EnumWindowsProc(callback)
+            skip_wait[0] = time.time()
+            while proc.poll() is None:
+                EnumWindows(cb, 0)
+                # Skip-States nach 3s überspringen, falls kein passendes Fenster
+                if state_idx[0] < len(states) and states[state_idx[0]]["action"] == "skip":
+                    timeout = states[state_idx[0]].get("delay", 3)
+                    if time.time() - skip_wait[0] > timeout:
+                        state_idx[0] += 1
+                        skip_wait[0] = time.time()
+                time.sleep(0.3)
+        except:
+            pass
+
+    def _ensure_npcap():
+        # Prüfen, ob Npcap installiert ist (über Dienst "npcap" oder "npf")
+        npcap_found = False
+        for svc in ("npcap", "npf"):
+            try:
+                r = subprocess.run(['sc', 'query', svc], capture_output=True, text=True, timeout=5,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                if "RUNNING" in r.stdout or "STOPPED" in r.stdout:
+                    npcap_found = True
+                    break
+            except:
+                pass
+        if npcap_found:
+            return True
+
+        splash.after(0, lambda: splash_label.config(text="Npcap wird nachgeladen … (~ 1 Minute)"))
+        url = "https://npcap.com/dist/npcap-1.88.exe"
+        exe = os.path.join(tempfile.gettempdir(), "npcap-1.88.exe")
+        ok = False
+        try:
+            r = subprocess.run(["curl", "-L", "-o", exe, url], capture_output=True, timeout=120, **_subprocess_kwargs())
+            ok = r.returncode == 0
+        except:
+            pass
+        if not ok:
+            try:
+                ps = f'$f="{exe}"; Invoke-WebRequest "{url}" -OutFile $f; Start-Process $f -Wait'
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=180,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+                ok = True
+            except:
+                pass
+        if not ok:
+            return False
+
+        splash.after(0, lambda: splash_label.config(text="Installiere Npcap …"))
+        proc = subprocess.Popen([exe], shell=True)
+        # Warten, bis das erste Npcap-Fenster erscheint
+        user32 = ctypes.windll.user32
+        EnumWindows = user32.EnumWindows
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+        GetWindowTextLengthW = user32.GetWindowTextLengthW
+        GetWindowTextW = user32.GetWindowTextW
+        found_hwnd = [None]
+
+        def find_npcap(hwnd, _):
+            length = GetWindowTextLengthW(hwnd) + 1
+            buf = ctypes.create_unicode_buffer(length)
+            GetWindowTextW(hwnd, buf, length)
+            if "Npcap 1.88 Setup" in buf.value:
+                found_hwnd[0] = hwnd
+                return False
+            return True
+
+        cb = EnumWindowsProc(find_npcap)
+        while proc.poll() is None and found_hwnd[0] is None:
+            EnumWindows(cb, 0)
+            if found_hwnd[0] is None:
+                time.sleep(0.3)
+        if found_hwnd[0] is None:
+            proc.wait()
+        else:
+            # Installationsroutine: feste Zeitabstände, keine Fensterprüfung mehr
+            def send_enter(hwnd):
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(0.1)
+                user32.keybd_event(0x0D, 0, 0, 0)
+                time.sleep(0.05)
+                user32.keybd_event(0x0D, 0, 2, 0)
+
+            send_enter(found_hwnd[0])  # 0.0s → Enter (1. Fenster)
+            time.sleep(0.1)            # 0.1s
+            send_enter(found_hwnd[0])  #      → Enter (2. Fenster)
+            time.sleep(0.2)            # 0.3s
+            send_enter(found_hwnd[0])  #      → Enter (3. Fenster)
+            time.sleep(20)             # 20.3s
+            send_enter(found_hwnd[0])  #      → Enter (4. Fenster)
+            time.sleep(0.1)            # 20.4s
+            send_enter(found_hwnd[0])  #      → Enter (5. Fenster)
+            time.sleep(0.1)            # 20.5s
+            send_enter(found_hwnd[0])  #      → Enter (6. Fenster)
+            proc.wait()
+        proc.wait()
+        return True
+
     def _ensure_nmap():
+        # Npcap muss vor Nmap installiert sein
+        splash.after(0, lambda: splash_label.config(text="Prüfe Npcap …"))
+        _ensure_npcap()
+
         def _verify():
             try:
                 r = subprocess.run(["nmap", "--version"], capture_output=True, text=True, timeout=5, **_subprocess_kwargs())
@@ -2178,10 +2331,12 @@ def show_loading_gui():
                 traceback.print_exc(file=_f)
                 _f.write("\n")
 
-    threading.Thread(target=_safe_load_worker, daemon=True).start()
-    # Splash ggf. einblenden (wenn kein Passwort-Dialog ihn bereits animiert hat)
+    # Splash einblenden, dann Aufgaben starten
     if str(splash.state()) == "withdrawn":
-        slide_in(splash, 520, 320)
+        slide_in(splash, 520, 320, on_done=lambda: threading.Thread(target=_safe_load_worker, daemon=True).start())
+    else:
+        # Splash bereits sichtbar (via Passwort-Dialog) → Thread sofort starten
+        threading.Thread(target=_safe_load_worker, daemon=True).start()
     set_titlebar_style(splash)
     try:
         root.mainloop()
@@ -2291,7 +2446,7 @@ def add_kasse_ordner_row(parent, folder_path):
 
 def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse_install_datum,
               kasse_ordner, arbeitsstationen, last_windows_update, boot_time, uptime_str, tv_id, anydesk_id,
-              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260531", nmap_ok=False, splash=None):
+              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260532", nmap_ok=False, splash=None):
     global app_running
 
     root.title(f"KDtool v{version_str} - Keller & Dürr Kassensysteme AG")
@@ -2461,7 +2616,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
 
     def refresh_network_display():
         def worker():
-            time.sleep(2)
+            time.sleep(10)
             new_net = get_network()
             # Bei "Keine Verbindung" nach dem Umschalten nochmal versuchen
             for _ in range(3):

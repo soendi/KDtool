@@ -188,6 +188,7 @@ def restart_as_admin(extra_flag=""):
 stop_event = threading.Event()
 app_running = True
 vlan_scan_id = 0
+_vlan_scan_cache = None
 
 #########################################
 # NETZWERK-FUNKTIONEN
@@ -377,7 +378,7 @@ def set_dhcp():
 
     Set-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
     Set-DnsClientServerAddress -InterfaceIndex $index -ResetServerAddresses -ErrorAction SilentlyContinue
-    ipconfig /renew | Out-Null
+    netsh interface ip set address name=$($route.InterfaceAlias) source=dhcp | Out-Null
     "DHCP wurde vollständig aktiviert."
     """
     try:
@@ -524,31 +525,142 @@ def is_ipv4_address(value):
         return False
 
 
-def get_device_name(ip_addr, mac):
+def _safe_kill(proc):
     try:
-        socket.setdefaulttimeout(0.8)
-        return socket.gethostbyaddr(ip_addr)[0]
-    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    except:
         pass
 
+
+def _monitor_windows(proc, log_callback, poll_interval=0.3):
+    """Überwacht Fenster eines laufenden cleanmgr-Prozesses und führt Aktionen aus."""
     try:
-        result = subprocess.run(
-            ["nbtstat", "-A", ip_addr],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=2,
-            **_subprocess_kwargs(),
+        user32 = ctypes.windll.user32
+        EnumWindows = user32.EnumWindows
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+        GetWindowTextLengthW = user32.GetWindowTextLengthW
+        GetWindowTextW = user32.GetWindowTextW
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        IsWindowVisible = user32.IsWindowVisible
+
+        states = [
+            {"match": "Datenträgerbereinigung : Laufwerkauswahl", "action": "enter", "log": "Laufwerkauswahl"},
+            {"match": "Datenträgerbereinigung",                   "action": "skip",  "log": "Datenträgerbereinigung (warten)"},
+            {"match_fn": lambda t: t.startswith("Datenträgerbereinigung für") and "(C:)" in t,
+                                                                    "action": "enter", "log": "Datenträgerbereinigung für ... (C:)"},
+            {"match": "Datenträgerbereinigung",                   "action": "enter", "log": "Datenträgerbereinigung (2)"},
+            {"match": "Datenträgerbereinigung",                   "action": "skip",  "log": "Datenträgerbereinigung (3)"},
+            {"match": "Speicherplatzbenachrichtigung",            "action": "enter", "log": "Speicherplatzbenachrichtigung"},
+        ]
+        state_idx = [0]
+
+        def send_enter(hwnd):
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.1)
+            user32.keybd_event(0x0D, 0, 0, 0)
+            time.sleep(0.05)
+            user32.keybd_event(0x0D, 0, 2, 0)
+
+        seen = set()
+
+        def callback(hwnd, _):
+            try:
+                if not IsWindowVisible(hwnd):
+                    return True
+                pid = ctypes.c_ulong()
+                GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value != proc.pid:
+                    return True
+                if hwnd in seen:
+                    return True
+                seen.add(hwnd)
+                length = GetWindowTextLengthW(hwnd) + 1
+                buf = ctypes.create_unicode_buffer(length)
+                GetWindowTextW(hwnd, buf, length)
+                title = buf.value.strip()
+                if not title:
+                    return True
+                now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                if state_idx[0] < len(states):
+                    st = states[state_idx[0]]
+                    matched = False
+                    if "match_fn" in st:
+                        matched = st["match_fn"](title)
+                    else:
+                        matched = (title == st["match"])
+                    if matched:
+                        label = st["log"]
+                        if st["action"] == "enter":
+                            log_callback(f"[{now}] '{label}' erkannt -> Enter")
+                            send_enter(hwnd)
+                        else:
+                            log_callback(f"[{now}] '{label}' erkannt -> warten")
+                        state_idx[0] += 1
+                        return True
+                log_callback(f"[{now}] Fenster: '{title}'")
+            except:
+                pass
+            return True
+
+        cb = EnumWindowsProc(callback)
+        while proc.poll() is None:
+            EnumWindows(cb, 0)
+            time.sleep(poll_interval)
+        log_callback(">> cleanmgr beendet.")
+    except Exception as e:
+        log_callback(f">> cleanmgr Fehler: {e}")
+
+def get_device_name(ip_addr, mac):
+    # Methode 1: Reverse-DNS
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            name = pool.submit(lambda: socket.gethostbyaddr(ip_addr)[0]).result(timeout=2)
+            if name and name != ip_addr:
+                return name.split(".")[0]
+    except:
+        pass
+    # Methode 2: ping -a (Windows-NetBIOS-Auflösung)
+    try:
+        proc = subprocess.Popen(
+            ["ping", "-a", "-n", "1", "-w", "500", ip_addr],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        for line in result.stdout.splitlines():
+        timer = threading.Timer(2.0, _safe_kill, [proc])
+        timer.start()
+        out, _ = proc.communicate()
+        timer.cancel()
+        for line in out.splitlines():
+            m = re.match(r"^Pinging\s+(\S+)\s+\[", line)
+            if m:
+                name = m.group(1)
+                if name != ip_addr and not name.startswith(("unknown", "UNKNOWN")):
+                    return name
+    except:
+        pass
+    # Methode 3: nbtstat (reine NetBIOS-Abfrage)
+    try:
+        proc = subprocess.Popen(
+            ["nbtstat", "-A", ip_addr],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        timer = threading.Timer(2.0, _safe_kill, [proc])
+        timer.start()
+        out, _ = proc.communicate()
+        timer.cancel()
+        for line in out.splitlines():
             if "<00>" in line and "UNIQUE" in line.upper():
                 parts = line.split()
                 if parts and parts[0] not in ("Name", "MAC"):
                     return parts[0]
-    except Exception:
+    except:
         pass
-
     return "-"
 
 
@@ -605,7 +717,38 @@ def get_printers():
     except:
         return [("Keine Drucker gefunden", "Spooler prüfen", "0", "0")]
 
-def load_vlan(primary_tree, extended_tree, root, ip, extended_list, progress_label=None, progress_bar=None, on_scan_done=None):
+def _nmap_xml_scan(targets):
+    """Führt nmap -sn -R -oX - aus und gibt Liste von (ip, name, mac, vendor) zurück."""
+    import xml.etree.ElementTree as ET
+    try:
+        r = subprocess.run(
+            ["nmap", "-sn", "-R", "-oX", "-"] + targets,
+            capture_output=True, text=True, encoding="utf-8", errors="ignore",
+            timeout=30, **_subprocess_kwargs(),
+        )
+        if r.returncode != 0:
+            return None
+        root = ET.fromstring(r.stdout)
+        results = []
+        for host in root.findall("host"):
+            status = host.find("status")
+            if status is None or status.get("state") != "up":
+                continue
+            ip_el = host.find("address[@addrtype='ipv4']")
+            if ip_el is None:
+                continue
+            ip = ip_el.get("addr", "")
+            mac_el = host.find("address[@addrtype='mac']")
+            mac = mac_el.get("addr", "") if mac_el is not None else ""
+            vendor = mac_el.get("vendor", "") if mac_el is not None else ""
+            hostname_el = host.find("hostnames/hostname")
+            name = hostname_el.get("name", "") if hostname_el is not None else ""
+            results.append((ip, name, mac, vendor))
+        return results
+    except:
+        return None
+
+def load_vlan(primary_tree, extended_tree, root, ip, extended_list, progress_label=None, progress_bar=None, on_scan_done=None, nmap_ok=False):
     global vlan_scan_id
     if not ip or ip == "Fehler" or "." not in ip:
         if on_scan_done:
@@ -647,93 +790,85 @@ def load_vlan(primary_tree, extended_tree, root, ip, extended_list, progress_lab
             pass
 
     def worker():
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        completed = 0
-
-        def ping_one(ip):
-            subprocess.run(
-                ["ping", "-n", "1", "-w", "100", ip],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                **_subprocess_kwargs(),
-            )
-            return ip
-
-        with ThreadPoolExecutor(max_workers=50) as pool:
-            futures = {pool.submit(ping_one, t): t for t in all_targets}
-            for future in as_completed(futures):
-                if scan_id != vlan_scan_id or not app_running or stop_event.is_set():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    return
-                completed += 1
-                if progress_bar is not None and completed % 5 == 0:
-                    try:
-                        root.after(0, lambda v=completed: progress_bar.config(value=v))
-                    except:
-                        pass
-
-        if scan_id != vlan_scan_id or not app_running or stop_event.is_set():
-            return
-
         if progress_label is not None:
             try:
-                root.after(0, lambda: progress_label.config(text="Lese ARP-Tabelle aus …"))
+                root.after(0, lambda: progress_label.config(text="Lese ARP-Tabelle …"))
+            except:
+                pass
+        if progress_bar is not None:
+            try:
+                root.after(0, lambda: progress_bar.start(10))
             except:
                 pass
 
-        arp_out = subprocess.run(
-            ["arp", "-a"], capture_output=True, text=True, encoding="utf-8", errors="ignore",
-            **_subprocess_kwargs(),
-        ).stdout
-
-        if progress_label is not None:
-            try:
-                root.after(0, lambda: progress_label.config(text="Verarbeite ARP-Einträge …"))
-            except:
-                pass
-
-        entries = {}
-        own_ip = ip
-        for line in arp_out.splitlines():
-            if "-" not in line:
-                continue
-            parts = line.split()
-            if len(parts) < 2 or scan_id != vlan_scan_id or not app_running:
-                continue
-            ip_addr, mac = parts[0], parts[1]
-            if not is_ipv4_address(ip_addr):
-                continue
-            addr_base = ".".join(ip_addr.split(".")[:3])
-            if addr_base not in bases:
-                continue
-            is_primary = (addr_base == primary_base)
-            name = get_device_name(ip_addr, mac)
-            entries[ip_addr] = (name, mac, is_primary)
-
-        if progress_label is not None:
-            try:
-                root.after(0, lambda: progress_label.config(text="Sortiere Einträge …"))
-            except:
-                pass
-
-        if scan_id == vlan_scan_id and app_running and not stop_event.is_set():
-            if own_ip not in entries:
-                own_mac = "-"
+        nmap_results = None
+        if nmap_ok:
+            if progress_label is not None:
                 try:
-                    ps = f'Get-NetIPAddress -IPAddress "{own_ip}" | Get-NetAdapter | Select-Object -ExpandProperty MacAddress'
-                    out = subprocess.run(
-                        ["powershell", "-NoProfile", "-Command", ps],
-                        capture_output=True, text=True, encoding="utf-8", errors="ignore",
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                    ).stdout.strip()
-                    if out:
-                        own_mac = out
+                    root.after(0, lambda: progress_label.config(text="Scanne mit Nmap …"))
                 except:
                     pass
-                entries[own_ip] = (socket.gethostname(), own_mac, True)
+            targets = []
+            for base in bases:
+                targets.append(f"{base}.1-255")
+            nmap_results = _nmap_xml_scan(targets)
+
+        if nmap_results is not None:
+            alive = set()
+            own_ip = ip
+            for entry in nmap_results:
+                alive.add(entry[0])
+            if not alive:
+                alive.add(own_ip)
+            entries = {}
+            for entry in nmap_results:
+                ip_a, name, mac, vendor = entry
+                is_primary = ".".join(ip_a.split(".")[:3]) == primary_base
+                if not name:
+                    name = "-"
+                entries[ip_a] = (name, mac, vendor, is_primary)
+            if own_ip not in entries:
+                entries[own_ip] = (socket.gethostname(), "", "", True)
+        else:
+            alive = set()
+            own_ip = ip
+            try:
+                r = subprocess.run(["arp", "-a"], capture_output=True, text=True, encoding="utf-8",
+                                   errors="ignore", timeout=5, **_subprocess_kwargs())
+                for line in r.stdout.splitlines():
+                    if "-" not in line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    ip_a = parts[0]
+                    if not is_ipv4_address(ip_a):
+                        continue
+                    a_base = ".".join(ip_a.split(".")[:3])
+                    if a_base in bases:
+                        alive.add(ip_a)
+            except:
+                pass
+            if not alive:
+                alive.add(own_ip)
+            if progress_label is not None:
+                try:
+                    root.after(0, lambda: progress_label.config(text="Löse Namen auf …"))
+                except:
+                    pass
+            name_map = {own_ip: socket.gethostname()}
+            for a in alive:
+                if a != own_ip:
+                    name_map[a] = get_device_name(a, "")
+            entries = {}
+            for a in sorted(alive, key=lambda x: tuple(int(p) for p in x.split("."))):
+                is_primary = ".".join(a.split(".")[:3]) == primary_base
+                entries[a] = (name_map.get(a, "-"), "", "", is_primary)
+
+        if scan_id == vlan_scan_id and app_running and not stop_event.is_set():
             for ext_ip, _ in extended_list:
                 if ext_ip not in entries:
-                    entries[ext_ip] = (socket.gethostname(), "-", False)
+                    entries[ext_ip] = (socket.gethostname(), "", "", False)
 
         def insert_entries():
             if not root.winfo_exists() or scan_id != vlan_scan_id or not app_running or stop_event.is_set():
@@ -744,16 +879,17 @@ def load_vlan(primary_tree, extended_tree, root, ip, extended_list, progress_lab
                 extended_tree.delete(item)
             sorted_ips = sorted(entries, key=lambda x: tuple(int(p) for p in x.split(".")))
             for ip_addr in sorted_ips:
-                name, mac, is_primary = entries[ip_addr]
+                name, mac, vendor, is_primary = entries[ip_addr]
                 tree = primary_tree if is_primary else extended_tree
                 tag = ("own",) if ip_addr == own_ip else ()
-                tree.insert("", "end", values=(ip_addr, name, mac), tags=tag)
+                tree.insert("", "end", values=(ip_addr, name, mac, vendor), tags=tag)
             primary_tree.tag_configure("own", background="#FFE0B2")
             extended_tree.tag_configure("own", background="#FFE0B2")
             if progress_label is not None:
                 progress_label.config(text=f"Scan abgeschlossen. {len(entries)} Geräte gefunden.")
             if progress_bar is not None:
-                progress_bar.config(value=progress_bar.cget("maximum"))
+                progress_bar.stop()
+                progress_bar.config(mode="determinate", maximum=100, value=100)
             if on_scan_done:
                 on_scan_done()
 
@@ -763,6 +899,86 @@ def load_vlan(primary_tree, extended_tree, root, ip, extended_list, progress_lab
             pass
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def _background_vlan_scan(ip, extended_list, nmap_ok=False):
+    global _vlan_scan_cache
+    if not ip or ip == "Fehler" or "." not in ip:
+        return
+    try:
+        bases = set()
+        primary_base = ".".join(ip.split(".")[:3])
+        bases.add(primary_base)
+        for ext_ip, _ in extended_list:
+            bases.add(".".join(ext_ip.split(".")[:3]))
+
+        own_ip = ip
+        nmap_results = None
+        if nmap_ok:
+            targets = []
+            for base in bases:
+                targets.append(f"{base}.1-255")
+            nmap_results = _nmap_xml_scan(targets)
+
+        entries_primary = []
+        entries_extended = []
+
+        if nmap_results is not None:
+            for entry in nmap_results:
+                ip_a, name, mac, vendor = entry
+                is_primary = ".".join(ip_a.split(".")[:3]) == primary_base
+                if not name:
+                    name = "-"
+                e = (ip_a, name, mac, vendor)
+                if is_primary:
+                    entries_primary.append(e)
+                else:
+                    entries_extended.append(e)
+            own_found = any(e[0] == own_ip for e in nmap_results)
+            if not own_found:
+                entries_primary.insert(0, (own_ip, socket.gethostname(), "", ""))
+        else:
+            alive = set()
+            r = subprocess.run(["arp", "-a"], capture_output=True, text=True, encoding="utf-8",
+                               errors="ignore", timeout=5, **_subprocess_kwargs())
+            for line in r.stdout.splitlines():
+                if "-" not in line:
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                ip_a = parts[0]
+                if not is_ipv4_address(ip_a):
+                    continue
+                a_base = ".".join(ip_a.split(".")[:3])
+                if a_base in bases:
+                    alive.add(ip_a)
+            if not alive:
+                alive.add(own_ip)
+            name_map = {own_ip: socket.gethostname()}
+            for a in alive:
+                if a != own_ip:
+                    name_map[a] = get_device_name(a, "")
+            for a in sorted(alive, key=lambda x: tuple(int(p) for p in x.split("."))):
+                is_primary = ".".join(a.split(".")[:3]) == primary_base
+                e = (a, name_map.get(a, "-"), "", "")
+                if is_primary:
+                    entries_primary.append(e)
+                else:
+                    entries_extended.append(e)
+
+        for ext_ip, _ in extended_list:
+            if not any(e[0] == ext_ip for e in entries_primary + entries_extended) and ext_ip != own_ip:
+                entries_extended.append((ext_ip, socket.gethostname(), "", ""))
+
+        _vlan_scan_cache = {
+            "primary": entries_primary,
+            "extended": entries_extended,
+            "own_ip": own_ip,
+        }
+    except Exception:
+        pass
+
 
 NETWORK_BACKUP_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "network_backup.json")
 
@@ -1007,6 +1223,32 @@ def extract_firma_data(kasse_ordner):
                 pass
 
     return None, "Firmendaten konnten nicht ausgelesen werden."
+
+
+def extract_firma_data_db():
+    """Liest Firmendaten direkt aus der PostgreSQL-Datenbank."""
+    target_cols = ["faort", "fabetrieb", "fafirmaadresse", "fafirmaplz",
+                   "falocationname", "falocationadresse", "falocationplz", "falocationort"]
+    try:
+        import pg8000
+        conn = pg8000.connect(host="localhost", port=5432, database="x3000", user="postgres", password="postgres")
+        cur = conn.cursor()
+        cur.execute("SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='x3000demo' AND table_name='kafasql'")
+        existing = {r[0] for r in cur.fetchall()}
+        cols = [c for c in target_cols if c in existing]
+        if not cols:
+            conn.close()
+            return None, "Keine Firmenspalten in DB gefunden."
+        cur.execute(f'SELECT {",".join(cols)} FROM x3000demo.kafasql LIMIT 1')
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            result = {col: (row[i] or "") for i, col in enumerate(cols)}
+            return result, None
+        return None, "Keine Firmendaten in DB."
+    except Exception as e:
+        return None, f"DB-Fehler: {e}"
 
 
 TEAMVIEWER_CANDIDATES = (
@@ -1370,8 +1612,17 @@ def create_pc_infos_text(report_data):
                 lines.append("    Keine Drucker gefunden")
         elif dtype == "vlan":
             if data:
-                for ip, name, mac in data:
-                    lines.append(f"    {ip:<18}  {name:<30}  {mac}")
+                for entry in data:
+                    ip = entry[0]
+                    name = entry[1] if len(entry) > 1 else "-"
+                    mac = entry[2] if len(entry) > 2 else ""
+                    vendor = entry[3] if len(entry) > 3 else ""
+                    line = f"    {ip:<16}  {name:<24}"
+                    if mac:
+                        line += f"  {mac:<18}"
+                    if vendor:
+                        line += f"  {vendor}"
+                    lines.append(line)
             else:
                 lines.append("    Keine Geraete gefunden")
         elif dtype == "firma":
@@ -1436,9 +1687,17 @@ def slide_in(window, width, height, speed=60, interval=5):
     screen_height = window.winfo_screenheight()
     x = (screen_width - width) // 2
     target_y = (screen_height - height) // 2
+    if target_y < 0:
+        target_y = 0
+    # Position oberhalb setzen, ausrechnen, dann einblenden
     window.geometry(f"{width}x{height}+{x}+{-height}")
+    window.update_idletasks()
     window.deiconify()
     window.update_idletasks()
+    # Prüfen, ob wir bereits am Ziel sind
+    if -height >= target_y:
+        window.geometry(f"+{x}+{target_y}")
+        return
     state = {"y": -height}
 
     def animate():
@@ -1496,7 +1755,7 @@ def show_loading_gui():
     except:
         checked = False
         password_ok = False
-    splash_version = "260530"
+    splash_version = "260531"
 
     root = tk.Tk()
     _icon_path = os.path.join(_exe_dir, "KDtool.ico")
@@ -1513,12 +1772,47 @@ def show_loading_gui():
     root.title(f"KDtool v{splash_version} - Keller & Dürr Kassensysteme AG")
     root.configure(bg="white")
     root.resizable(True, True)
-    def _tk_exc_handler(exc, val, tb):
-        with open(_log_file, "a") as _f:
-            _f.write(f"=== {_time.strftime('%Y-%m-%d %H:%M:%S')} TKINTER CALLBACK ERROR ===\n")
-            traceback.print_exception(exc, val, tb, file=_f)
-            _f.write("\n")
-    root.report_callback_exception = _tk_exc_handler
+
+    # Splash früh erstellen (für koordinierte Animation mit Passwort-Dialog)
+    splash = tk.Toplevel(root)
+    if os.path.isfile(_icon_path):
+        try:
+            splash.iconbitmap(bitmap=_icon_path)
+        except Exception:
+            pass
+    splash.withdraw()
+    splash.title(f"KDtool v{splash_version} - Keller & Dürr Kassensysteme AG")
+    splash.configure(bg="white")
+    splash.resizable(False, False)
+
+    tk.Label(splash, text="KDtool", font=("Segoe UI", 16, "bold"),
+             fg="#0078d4", bg="white").pack(pady=(50, 2))
+    tk.Label(splash, text="Keller & Dürr Kassensysteme AG", font=("Segoe UI", 12),
+             fg="#0078d4", bg="white").pack(pady=(0, 25))
+
+    splash_label = tk.Label(
+        splash,
+        text="Sammle Daten, bitte warten...",
+        font=("Segoe UI", 11),
+        fg="#555555",
+        bg="white",
+    )
+    splash_label.pack(pady=(0, 25))
+
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("blue.Horizontal.TProgressbar", background="#0078d4")
+    progress = ttk.Progressbar(splash, style="blue.Horizontal.TProgressbar", mode="determinate", maximum=100, length=400)
+    progress["value"] = 0
+    progress.pack(pady=20)
+
+    def _transition_dialog_to_splash(dlg):
+        splash_label.config(text="Sammle Daten, bitte warten...")
+        def _on_dlg_gone():
+            try: dlg.destroy()
+            except: pass
+            root.after(200, lambda: (slide_in(splash, 520, 320), set_titlebar_style(splash)))
+        slide_out(dlg, speed=120, interval=5, on_done=_on_dlg_gone)
 
     if not is_admin() or not checked:
         dialog = tk.Toplevel(root)
@@ -1544,7 +1838,7 @@ def show_loading_gui():
             text="Keller & Dürr Kassensysteme AG",
             font=("Segoe UI", 11),
             fg="#0078d4", bg="white",
-        ).pack(pady=(0, 12))
+        ).pack(pady=(0, 6))
 
         pw_ok = [False]
         restart = [False]
@@ -1553,7 +1847,7 @@ def show_loading_gui():
             def on_start():
                 now = datetime.now()
                 pw_ok[0] = password_entry.get() == f"{now.month + 1:02d}{now.day + 1:02d}"
-                slide_out(dialog, on_done=dialog.destroy)
+                _transition_dialog_to_splash(dialog)
 
             btn_frame = tk.Frame(dialog, bg="white")
             btn_frame.pack(pady=(15, 0))
@@ -1580,12 +1874,12 @@ def show_loading_gui():
                 now = datetime.now()
                 pw_ok[0] = password_entry.get() == f"{now.month + 1:02d}{now.day + 1:02d}"
                 restart[0] = True
-                slide_out(dialog, on_done=dialog.destroy)
+                _transition_dialog_to_splash(dialog)
 
             def on_no():
                 now = datetime.now()
                 pw_ok[0] = password_entry.get() == f"{now.month + 1:02d}{now.day + 1:02d}"
-                slide_out(dialog, on_done=dialog.destroy)
+                _transition_dialog_to_splash(dialog)
 
             btn_frame = tk.Frame(dialog, bg="white")
             btn_frame.pack(pady=(15, 0))
@@ -1620,7 +1914,7 @@ def show_loading_gui():
                     ja_btn.config(text="Ja")
 
         pw_frame = tk.Frame(dialog, bg="white")
-        pw_frame.pack(pady=(8, 0))
+        pw_frame.pack(pady=(30, 0))
         tk.Label(pw_frame, text="K&D Servicepasswort:", font=("Segoe UI", 10), fg="#444444", bg="white").pack(side="left", padx=(0, 8))
         password_entry = tk.Entry(pw_frame, width=6, font=("Segoe UI", 12, "bold"), show="\u25CF", justify="center",
                                   relief="solid", bd=1)
@@ -1643,7 +1937,7 @@ def show_loading_gui():
                  "die durch unsachgemässe oder fehlerhafte Anwendung dieser Software entstehen.",
             font=("Segoe UI", 7),
             fg="#999999", bg="white", wraplength=480, justify="center",
-        ).pack(side="bottom", pady=(0, 12))
+        ).pack(side="bottom", pady=(0, 6))
 
         if is_admin():
             dialog.bind("<Return>", lambda e: on_start())
@@ -1661,104 +1955,152 @@ def show_loading_gui():
 
         password_ok = pw_ok[0]
 
-    splash = tk.Toplevel(root)
-    if os.path.isfile(_icon_path):
-        try:
-            splash.iconbitmap(bitmap=_icon_path)
-        except Exception:
-            pass
-    splash.withdraw()
-    splash.title(f"KDtool v{splash_version} - Keller & Dürr Kassensysteme AG")
-    splash.configure(bg="white")
-    splash.resizable(False, False)
-
-    tk.Label(
-        splash,
-        text="KDtool",
-        font=("Segoe UI", 16, "bold"),
-        fg="#0078d4",
-        bg="white",
-    ).pack(pady=(40, 2))
-
-    tk.Label(
-        splash,
-        text="Keller & Dürr Kassensysteme AG",
-        font=("Segoe UI", 12),
-        fg="#0078d4",
-        bg="white",
-    ).pack(pady=(0, 10))
-
-    splash_label = tk.Label(
-        splash,
-        text="Daten werden abgerufen, bitte warten...",
-        font=("Segoe UI", 11),
-        fg="#555555",
-        bg="white",
-    )
-    splash_label.pack(pady=(0, 20))
-
-    style = ttk.Style()
-    style.theme_use("clam")
-    style.configure("blue.Horizontal.TProgressbar", background="#0078d4")
-    progress = ttk.Progressbar(splash, style="blue.Horizontal.TProgressbar", mode="determinate", maximum=100, length=400)
-    progress.pack(pady=10)
-
     loaded = {"network": None, "dhcp": None, "printers": None, "internet": None,
               "windows": None, "kasse_version": None, "kasse_install_datum": None,
               "last_windows_update": None, "kasse_ordner": None, "arbeitsstationen": None,
               "boot_time": None, "uptime_str": None, "tv_id": None, "anydesk_id": None,
-              "kasse_firma_data": None, "firewall": None}
-    load_steps = [
-        ("network", get_network),
-        ("dhcp", get_dhcp_status),
-        ("printers", get_printers),
-        ("internet", internet_status),
-        ("windows", windows_info),
-        ("kasse_version", get_kasse_version),
-        ("kasse_install_datum", get_kasse_install_datum),
-        ("last_windows_update", get_last_windows_update),
-        ("tv_id", get_teamviewer_id),
-        ("anydesk_id", get_anydesk_id),
-        ("firewall", get_firewall_status),
-    ]
+              "kasse_firma_data": None, "firewall": None, "nmap": False}
 
     def update_progress(value):
         progress["value"] = value
         splash.update_idletasks()
 
     def finish_loading():
-        def on_slide_done():
-            splash.destroy()
-            start_gui(root,
-                net=loaded["network"],
-                dhcp=loaded["dhcp"],
-                printers=loaded["printers"],
-                internet=loaded["internet"],
-                windows=loaded["windows"],
-                kasse_version=loaded["kasse_version"],
-                kasse_install_datum=loaded["kasse_install_datum"],
-                kasse_ordner=loaded["kasse_ordner"],
-                arbeitsstationen=loaded["arbeitsstationen"],
-                last_windows_update=loaded["last_windows_update"],
-                boot_time=loaded["boot_time"],
-                uptime_str=loaded["uptime_str"],
-                tv_id=loaded["tv_id"],
-                anydesk_id=loaded["anydesk_id"],
-                password_ok=password_ok,
-                kasse_firma_data=loaded["kasse_firma_data"],
-                firewall=loaded["firewall"],
-                version_str=splash_version,
-            )
-        slide_out(splash, on_done=on_slide_done)
+        _net = loaded["network"]
+        if _net and _net.get("ip") and _net["ip"] not in ("Keine Verbindung", "Fehler"):
+            threading.Thread(
+                target=_background_vlan_scan,
+                args=(_net["ip"], _net.get("extended_list", []), loaded.get("nmap", False)),
+                daemon=True,
+            ).start()
+        loaded["nmap"] = loaded.get("nmap", False)
+
+        splash_label.config(text="Bereite Oberfläche vor …")
+        splash.after(100, lambda: start_gui(root, splash=splash,
+            net=loaded["network"],
+            dhcp=loaded["dhcp"],
+            printers=loaded["printers"],
+            internet=loaded["internet"],
+            windows=loaded["windows"],
+            kasse_version=loaded["kasse_version"],
+            kasse_install_datum=loaded["kasse_install_datum"],
+            kasse_ordner=loaded["kasse_ordner"],
+            arbeitsstationen=loaded["arbeitsstationen"],
+            last_windows_update=loaded["last_windows_update"],
+            boot_time=loaded["boot_time"],
+            uptime_str=loaded["uptime_str"],
+            tv_id=loaded["tv_id"],
+            anydesk_id=loaded["anydesk_id"],
+            password_ok=password_ok,
+            kasse_firma_data=loaded["kasse_firma_data"],
+            firewall=loaded["firewall"],
+            version_str=splash_version,
+            nmap_ok=loaded["nmap"],
+        ))
+
+    def _ensure_nmap():
+        def _verify():
+            try:
+                r = subprocess.run(["nmap", "--version"], capture_output=True, text=True, timeout=5, **_subprocess_kwargs())
+                return r.returncode == 0
+            except:
+                return False
+
+        splash.after(0, lambda: splash_label.config(text="Prüfe Nmap…"))
+        if _verify():
+            return True
+        splash.after(0, lambda: splash_label.config(text="Nmap wird nachgeladen … (~ 1 Minute)"))
+        # Download nmap
+        url = "https://nmap.org/dist/nmap-7.99-setup.exe"
+        exe = os.path.join(tempfile.gettempdir(), "nmap-setup.exe")
+        ok = False
+        try:
+            r = subprocess.run(["curl", "-L", "-o", exe, url], capture_output=True, timeout=120, **_subprocess_kwargs())
+            ok = r.returncode == 0
+        except:
+            pass
+        if not ok:
+            try:
+                ps = f'$f="{exe}"; Invoke-WebRequest "{url}" -OutFile $f; Start-Process $f -ArgumentList "/S" -Wait'
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=180, creationflags=subprocess.CREATE_NO_WINDOW)
+                ok = True
+            except:
+                pass
+        if ok:
+            splash.after(0, lambda: splash_label.config(text="Installiere Nmap …"))
+            subprocess.run([exe, "/S"], capture_output=True, timeout=120, **_subprocess_kwargs())
+            # Nmap-Pfad zur PATH-Umgebung für diesen Prozess hinzufügen
+            nmap_dir = r"C:\Program Files (x86)\Nmap"
+            if os.path.isdir(nmap_dir):
+                os.environ["PATH"] = nmap_dir + os.pathsep + os.environ.get("PATH", "")
+            # Desktop von nmap-Dateien säubern
+            try:
+                desktop = os.path.join(os.environ["USERPROFILE"], "Desktop")
+                for f in os.listdir(desktop):
+                    if "nmap" in f.lower():
+                        fp = os.path.join(desktop, f)
+                        if os.path.isfile(fp):
+                            os.remove(fp)
+            except:
+                pass
+        # Nochmals prüfen (nach Installation + PATH setzen)
+        splash.after(0, lambda: splash_label.config(text="Prüfe Nmap…"))
+        return _verify()
 
     def load_worker():
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        load_steps = [
+            ("network", get_network),
+            ("dhcp", get_dhcp_status),
+            ("printers", get_printers),
+            ("internet", internet_status),
+            ("windows", windows_info),
+            ("kasse_version", get_kasse_version),
+            ("kasse_install_datum", get_kasse_install_datum),
+            ("last_windows_update", get_last_windows_update),
+            ("tv_id", get_teamviewer_id),
+            ("anydesk_id", get_anydesk_id),
+            ("firewall", get_firewall_status),
+            ("nmap", _ensure_nmap),
+        ]
         total = len(load_steps)
-        for i, (key, loader) in enumerate(load_steps):
-            loaded[key] = loader()
-            pct = int((i + 1) / total * 100)
-            splash.after(0, update_progress, pct)
+        done = [0]
+        label_map = {
+            "network": "Lese Netzwerkkonfiguration …",
+            "dhcp": "Prüfe DHCP-Status …",
+            "printers": "Sammle Druckerinformationen …",
+            "internet": "Prüfe Internetverbindung …",
+            "windows": "Lese Windows-Informationen …",
+            "kasse_version": "Ermittle Kassenversion …",
+            "kasse_install_datum": "Ermittle Kassendaten …",
+            "last_windows_update": "Prüfe letzte Windows-Updates …",
+            "tv_id": "Lese TeamViewer-ID …",
+            "anydesk_id": "Lese AnyDesk-ID …",
+            "firewall": "Prüfe Firewall-Status …",
+            "nmap": "Prüfe Nmap …",
+        }
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {}
+            for key, loader in load_steps:
+                lbl = label_map.get(key, "Sammle Daten …")
+                splash.after(0, lambda t=lbl: splash_label.config(text=t))
+                futures[pool.submit(loader)] = key
+            for fut in as_completed(futures):
+                key = futures[fut]
+                try:
+                    loaded[key] = fut.result()
+                except Exception:
+                    loaded[key] = None
+                done[0] += 1
+                done_lbl = label_map.get(key, key)
+                splash.after(0, lambda t=f"✓ {done_lbl}": splash_label.config(text=t))
+                splash.after(0, update_progress, int(done[0] / total * 100))
         loaded["kasse_ordner"], loaded["arbeitsstationen"] = get_kasse_data()
-        firma_result, _ = extract_firma_data(loaded["kasse_ordner"])
+        splash.after(0, splash_label.config(text="Lese Firmendaten aus DB …"))
+        firma_result, _ = extract_firma_data_db()
+        if not firma_result:
+            splash.after(0, splash_label.config(text="Lese Firmendaten aus Dump …"))
+            firma_result, _ = extract_firma_data(loaded["kasse_ordner"])
         loaded["kasse_firma_data"] = firma_result
         loaded["boot_time"], loaded["uptime_str"] = get_uptime_str()
 
@@ -1774,7 +2116,9 @@ def show_loading_gui():
                 _f.write("\n")
 
     threading.Thread(target=_safe_load_worker, daemon=True).start()
-    slide_in(splash, 520, 220)
+    # Splash ggf. einblenden (wenn kein Passwort-Dialog ihn bereits animiert hat)
+    if str(splash.state()) == "withdrawn":
+        slide_in(splash, 520, 320)
     set_titlebar_style(splash)
     try:
         root.mainloop()
@@ -1796,7 +2140,7 @@ def show_loading_gui():
 #########################################
 def add_info_row(parent, label, value, value_fg="#000000", label_width=14):
     row = tk.Frame(parent, bg="white")
-    row.pack(fill="x", padx=30, pady=8)
+    row.pack(fill="x", padx=15, pady=5)
     tk.Label(
         row, text=f"{label}:", width=label_width, anchor="w", bg="white", fg="#444444", font=("Segoe UI", 10)
     ).pack(side="left")
@@ -1809,7 +2153,7 @@ def add_info_row(parent, label, value, value_fg="#000000", label_width=14):
 
 def add_section_title(parent, text, top_padding=25, on_refresh=None):
     header = tk.Frame(parent, bg="white")
-    header.pack(fill="x", padx=30, pady=(top_padding, 5))
+    header.pack(fill="x", padx=15, pady=(top_padding, 5))
     tk.Label(header, text=text, font=("Segoe UI", 13, "bold"), fg="#0078d4", bg="white").pack(side="left")
     if on_refresh:
         tk.Button(header, text="↻ Aktualisieren", font=("Segoe UI", 9), bg="#0078d4", fg="white",
@@ -1819,7 +2163,7 @@ def add_section_title(parent, text, top_padding=25, on_refresh=None):
 
 def add_ip_address_row(parent, primary_ip, extended_ips=""):
     ip_row = tk.Frame(parent, bg="white")
-    ip_row.pack(fill="x", padx=30, pady=8)
+    ip_row.pack(fill="x", padx=15, pady=8)
     tk.Label(
         ip_row, text="IP-Adresse:", width=22, anchor="w", bg="white", fg="#444444", font=("Segoe UI", 10)
     ).pack(side="left")
@@ -1838,7 +2182,7 @@ def add_ip_address_row(parent, primary_ip, extended_ips=""):
     )
     ext_val.pack(side="left", fill="x", expand=True)
     if extended_ips:
-        ext_row.pack(fill="x", padx=30, pady=(0, 8))
+        ext_row.pack(fill="x", padx=15, pady=(0, 8))
 
     return {"primary": ip_val, "extended": ext_val, "ext_row": ext_row}
 
@@ -1858,7 +2202,7 @@ def update_ip_address_row(ip_labels, primary_ip, extended_ips="", before_widget=
 
 def add_kasse_ordner_row(parent, folder_path):
     row = tk.Frame(parent, bg="white")
-    row.pack(fill="x", padx=30, pady=8)
+    row.pack(fill="x", padx=15, pady=8)
     tk.Label(
         row, text="Kassenordner:", width=14, anchor="w", bg="white", fg="#444444", font=("Segoe UI", 10)
     ).pack(side="left")
@@ -1884,11 +2228,22 @@ def add_kasse_ordner_row(parent, folder_path):
 
 def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse_install_datum,
               kasse_ordner, arbeitsstationen, last_windows_update, boot_time, uptime_str, tv_id, anydesk_id,
-              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260530"):
+              password_ok=True, kasse_firma_data=None, firewall=None, version_str="260531", nmap_ok=False, splash=None):
     global app_running
 
     root.title(f"KDtool v{version_str} - Keller & Dürr Kassensysteme AG")
     root.configure(bg="white")
+
+    _ico = os.path.join(_exe_dir, "KDtool.ico")
+    if getattr(sys, 'frozen', False):
+        _m = os.path.join(sys._MEIPASS, "KDtool.ico")
+        if os.path.isfile(_m):
+            _ico = _m
+    if os.path.isfile(_ico):
+        try:
+            root.iconbitmap(bitmap=_ico)
+        except:
+            pass
 
     style = ttk.Style()
     style.theme_use("clam")
@@ -1896,16 +2251,18 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
     style.configure("TNotebook", background="white")
     style.configure("TFrame", background="white")
     style.configure("TLabel", background="white", foreground="#333333")
-    style.configure("Treeview", background="white", fieldbackground="white", foreground="#222222", rowheight=28)
+    style.configure("Treeview", background="white", fieldbackground="white", foreground="#222222", rowheight=22)
     style.configure("Treeview.Heading", background="#0078d4", foreground="white", font=("Segoe UI", 10, "bold"))
     style.map("Treeview.Heading", background=[("active", "#005a9e")])
 
     tab_bar = tk.Frame(root, bg="white")
-    tab_bar.pack(fill="x", padx=10, pady=(5, 0))
+    tab_bar.pack(fill="x", padx=6, pady=(3, 0))
     tab_bar.grid_rowconfigure(0, weight=1)
 
+    kd_sub_bar = tk.Frame(root, bg="#e8e8e8")
+
     tabs = tk.Frame(root, bg="#cccccc", bd=1, relief="solid")
-    tabs.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+    tabs.pack(fill="both", expand=True, padx=6, pady=(0, 3))
 
     _tab_pages = {}
     _tab_buttons = {}
@@ -1982,19 +2339,19 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
             _tab_buttons[_tab_active].config(
                 bg=_get_tab_color(_tab_active), fg="#333333",
                 relief="raised", bd=2,
-                font=("Segoe UI", 10), padx=14, pady=8)
+                font=("Segoe UI", 9, "bold"), padx=12, pady=8)
         _tab_pages[name].pack(fill="both", expand=True)
         _tab_buttons[name].config(
             bg="#0078d4", fg="white",
-            relief="raised", bd=2,
-            font=("Segoe UI", 10, "bold"), padx=18, pady=14)
+            relief="sunken", bd=2,
+            font=("Segoe UI", 9, "bold"), padx=12, pady=8)
         _tab_active = name
 
     def _add_tab(page, text=""):
         _tab_pages[text] = page
         bg = _get_tab_color(text)
         btn = tk.Button(tab_bar, text=text, relief="raised", bd=2, cursor="hand2",
-                        bg=bg, fg="#333333", font=("Segoe UI", 10), padx=14, pady=8,
+                        bg=bg, fg="#333333", font=("Segoe UI", 9, "bold"), padx=12, pady=8,
                         command=lambda t=text: _switch_tab(t))
         btn.grid(row=0, column=_tab_col[0], sticky="s", padx=1)
         _tab_col[0] += 1
@@ -2036,12 +2393,19 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
         load_vlan(
             tree2_primary, tree2_extended, root, new_net["ip"], new_net.get("extended_list", []),
             progress_label=vlan_progress_label, progress_bar=vlan_progress_bar,
-            on_scan_done=on_scan_done,
+            on_scan_done=on_scan_done, nmap_ok=nmap_ok,
         )
 
     def refresh_network_display():
         def worker():
+            time.sleep(2)
             new_net = get_network()
+            # Bei "Keine Verbindung" nach dem Umschalten nochmal versuchen
+            for _ in range(3):
+                if new_net["ip"] not in ("Keine Verbindung", "Fehler"):
+                    break
+                time.sleep(2)
+                new_net = get_network()
             new_dhcp = get_dhcp_status()
             root.after(0, lambda: (
                 apply_network_data(new_net, new_dhcp),
@@ -2052,7 +2416,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
         threading.Thread(target=worker, daemon=True).start()
 
     refresh_top = tk.Frame(t1, bg="white")
-    refresh_top.pack(fill="x", padx=30, pady=(20, 0))
+    refresh_top.pack(fill="x", padx=15, pady=(10, 0))
     tk.Button(refresh_top, text="↻ Aktualisieren", font=("Segoe UI", 9), bg="#0078d4", fg="white",
               relief="flat", padx=10, pady=2, command=refresh_network_display).pack(side="right")
 
@@ -2079,7 +2443,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
         info_labels[label] = add_info_row(left_col, label, value, label_width=22)
 
     iface_frame = tk.Frame(left_col, bg="white")
-    iface_frame.pack(fill="x", padx=30, pady=8)
+    iface_frame.pack(fill="x", padx=15, pady=8)
     tk.Label(iface_frame, text="Interface:", width=22, anchor="w",
              bg="white", fg="#444444", font=("Segoe UI", 10)).pack(side="left")
 
@@ -2087,192 +2451,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
              font=("Segoe UI", 10, "bold"), justify="left")
     info_labels["Interface"].pack(side="left", fill="x", expand=True)
 
-    right_col = tk.Frame(net_content, bg="white")
-    right_col.pack(side="right", fill="both", expand=True, padx=(20, 0))
-
-    add_section_title(right_col, "Netzwerkeinstellungen ändern", top_padding=0)
-    for hint_line in [
-        "Hinweis: Für fixe IP sind IP, Subnetz, Gateway und DNS1 Pflicht. Subnetz als 255.255.255.0 oder 24.",
-        "Die Eingabefelder bleiben bei Umschaltungen unverändert.",
-        "„Einstellungen zurücksetzen“ stellt die ursprüngliche Konfiguration wieder her, die beim Start des Programms geladen wurde.",
-    ]:
-        tk.Label(
-            right_col,
-            text=hint_line,
-            font=("Segoe UI", 9),
-            fg="#666666",
-            bg="white",
-            justify="left",
-            anchor="w",
-            wraplength=820,
-        ).pack(anchor="w", padx=30, pady=(0, 2))
-    tk.Frame(right_col, bg="white", height=6).pack()
-
-    entries = {}
-
-    ext_list = net.get("extended_list", [])
-    ext_ips = [ip for ip, _ in ext_list]
-    ext_subnets = [prefix_to_mask(prefix) for _, prefix in ext_list]
-
-    def make_ip_row(label, keys, widths):
-        frame = tk.Frame(right_col, bg="white")
-        frame.pack(fill="x", padx=30, pady=7)
-        tk.Label(frame, text=label + ":", width=12, anchor="w",
-                 bg="white", fg="#444444").pack(side="left")
-        for key, w in zip(keys, widths):
-            e = tk.Entry(frame, width=w, font=("Segoe UI", 10), bg="white", relief="solid", bd=1)
-            e.pack(side="left", padx=4)
-            entries[key] = e
-
-    def open_iface_properties(name):
-        if name in ("Keine Verbindung", ""):
-            os.startfile("ncpa.cpl")
-            return
-        ps = (
-            'Add-Type -AssemblyName System.Windows.Forms\n'
-            '$s = New-Object -ComObject Shell.Application\n'
-            '$n = $s.NameSpace("shell:::{7007ACC7-3202-11D1-AAD2-00805FC1270E}")\n'
-            '$i = $n.Items() | Where-Object { $_.Name -eq "' + name + '" }\n'
-            'if ($i) {\n'
-            '    $i.InvokeVerb("properties")\n'
-                '    Start-Sleep -Milliseconds 1500\n'
-            '    [System.Windows.Forms.SendKeys]::SendWait("i")\n'
-            '    Start-Sleep -Milliseconds 300\n'
-            '    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")\n'
-            '    Start-Sleep -Milliseconds 200\n'
-            '    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")\n'
-            '    Start-Sleep -Milliseconds 200\n'
-            '    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")\n'
-            '}\n'
-            'while ($true) {\n'
-            '    [System.Windows.Forms.Application]::DoEvents()\n'
-            '    Start-Sleep -Milliseconds 100\n'
-            '}\n'
-        )
-        ps_path = os.path.join(os.environ.get("TEMP", "."), "kdtool_open_props.ps1")
-        try:
-            with open(ps_path, "w") as f:
-                f.write(ps)
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-                 "-ExecutionPolicy", "Bypass", "-File", ps_path]
-            )
-        except Exception:
-            os.startfile("ncpa.cpl")
-
-    ip_frame = tk.Frame(right_col, bg="white")
-    ip_frame.pack(fill="x", padx=30, pady=7)
-    tk.Label(ip_frame, text="IP:", width=12, anchor="w",
-             bg="white", fg="#444444").pack(side="left")
-    for key, w in zip(["IP", "IP_EXT1", "IP_EXT2"], [15, 15, 15]):
-        e = tk.Entry(ip_frame, width=w, font=("Segoe UI", 10), bg="white", relief="solid", bd=1)
-        e.pack(side="left", padx=4)
-        entries[key] = e
-    tk.Button(ip_frame, text="Netzwerkeinstellungen öffnen", font=("Segoe UI", 8),
-              bg="#0078d4", fg="white", relief="flat", cursor="hand2",
-              command=lambda: open_iface_properties(net["iface"])).pack(side="left", padx=(10, 0))
-
-    make_ip_row("Subnetz", ["Subnetz", "Subnetz_EXT1", "Subnetz_EXT2"], [15, 15, 15])
-    make_ip_row("Gateway", ["Gateway"], [15])
-    make_ip_row("DNS1", ["DNS1"], [15])
-    make_ip_row("DNS2", ["DNS2"], [15])
-
-    if net["ip"] == "Keine Verbindung":
-        entry_values = {"ip": "", "subnet": "", "gateway": "", "dns1": "", "dns2": ""}
-        ext_ip_vals = ["", ""]
-        ext_sub_vals = ["", ""]
-    else:
-        entry_values = net
-        ext_ip_vals = [ext_ips[i] if i < len(ext_ips) else "" for i in range(2)]
-        ext_sub_vals = [ext_subnets[i] if i < len(ext_subnets) else "" for i in range(2)]
-
-    entries["IP"].insert(0, entry_values["ip"])
-    entries["Subnetz"].insert(0, entry_values["subnet"])
-    entries["Gateway"].insert(0, entry_values["gateway"])
-    entries["DNS1"].insert(0, entry_values["dns1"])
-    entries["DNS2"].insert(0, entry_values["dns2"])
-    entries["IP_EXT1"].insert(0, ext_ip_vals[0])
-    entries["IP_EXT2"].insert(0, ext_ip_vals[1])
-    entries["Subnetz_EXT1"].insert(0, ext_sub_vals[0])
-    entries["Subnetz_EXT2"].insert(0, ext_sub_vals[1])
-
-    try:
-        save_network_backup(entries, dhcp == "Ja")
-    except OSError:
-        pass
-
-    btn_frame = tk.Frame(right_col, bg="white")
-    btn_frame.pack(anchor="w", padx=30, pady=10)
-
-    status_frame = tk.Frame(right_col, bg="white", height=200)
-    status_frame.pack(fill="x", padx=30, pady=(5, 12))
-    status_frame.pack_propagate(False)
-
-    status_label = tk.Label(
-        status_frame,
-        text="",
-        bg="white",
-        font=("Segoe UI", 11),
-        fg="#333333",
-        justify="left",
-        anchor="nw",
-        wraplength=900,
-    )
-    status_label.pack(fill="x")
-
-    def show_status(message):
-        if message.startswith("❌"):
-            color = "#d32f2f"
-        elif message.startswith("✅"):
-            color = "#28a745"
-        else:
-            color = "#333333"
-        status_label.config(text=message, fg=color)
-
-    btn_state = "normal" if password_ok else "disabled"
-
-    btn_dhcp = tk.Button(
-        btn_frame,
-        text="zu DHCP umschalten",
-        bg="#d32f2f",
-        fg="white",
-        font=("Segoe UI", 11, "bold"),
-        width=28,
-        height=1,
-        relief="flat",
-        state=btn_state,
-    )
-    btn_dhcp.pack(side="left", padx=(0, 10))
-
-    btn_static = tk.Button(
-        btn_frame,
-        text="Fixe IP setzen",
-        bg="#0078d4",
-        fg="white",
-        font=("Segoe UI", 11, "bold"),
-        width=28,
-        height=1,
-        relief="flat",
-        state=btn_state,
-    )
-    btn_static.pack(side="left", padx=(0, 10))
-
-    btn_restore = tk.Button(
-        btn_frame,
-        text="Einstellungen zurücksetzen",
-        bg="#6c757d",
-        fg="white",
-        font=("Segoe UI", 11, "bold"),
-        width=28,
-        height=1,
-        relief="flat",
-        state=btn_state,
-    )
-    btn_restore.pack(side="left")
-
-    status_label.pack(anchor="w", padx=30, pady=(5, 12))
-
-    # ====================== FIREWALL ======================
+    # ====================== FIREWALL (in linker Spalte) ======================
     def _set_firewall_labels(fw_data):
         fw_private_label.config(text="")
         fw_public_label.config(text="")
@@ -2322,17 +2501,17 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
 
     fw_state = "normal" if password_ok else "disabled"
 
-    add_section_title(t1, "Firewall", top_padding=60)
-    fw_row = tk.Frame(t1, bg="white")
-    fw_row.pack(fill="x", padx=30, pady=5)
+    add_section_title(left_col, "Firewall")
+    fw_row = tk.Frame(left_col, bg="white")
+    fw_row.pack(fill="x", padx=15, pady=5)
     tk.Label(fw_row, text="Privates Netzwerk:", width=20, anchor="w",
              bg="white", fg="#444444", font=("Segoe UI", 10)).pack(side="left")
     fw_private_label = tk.Label(fw_row, text="", anchor="w", bg="white",
                                 font=("Segoe UI", 10, "bold"))
     fw_private_label.pack(side="left")
 
-    fw_row2 = tk.Frame(t1, bg="white")
-    fw_row2.pack(fill="x", padx=30, pady=5)
+    fw_row2 = tk.Frame(left_col, bg="white")
+    fw_row2.pack(fill="x", padx=15, pady=5)
     tk.Label(fw_row2, text="Öffentliches Netzwerk:", width=20, anchor="w",
              bg="white", fg="#444444", font=("Segoe UI", 10)).pack(side="left")
     fw_public_label = tk.Label(fw_row2, text="", anchor="w", bg="white",
@@ -2340,16 +2519,204 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
     fw_public_label.pack(side="left")
 
     tk.Button(
-        t1, text="Firewall ein-/ausschalten",
+        left_col, text="Firewall ein/aus",
         bg="#d32f2f", fg="white",
         font=("Segoe UI", 11, "bold"),
-        width=28, height=1,
+        width=17, height=1,
         relief="flat",
         state=fw_state,
         command=_toggle_firewall,
-    ).pack(anchor="w", padx=30, pady=(10, 5))
+    ).pack(anchor="w", padx=15, pady=(5, 3))
 
     _set_firewall_labels(firewall)
+
+    right_col = tk.Frame(net_content, bg="white")
+    right_col.pack(side="right", fill="both", expand=True, padx=(20, 0))
+
+    add_section_title(right_col, "Netzwerkeinstellungen ändern", top_padding=0)
+    for hint_line in [
+        "Hinweis: Für fixe IP sind IP, Subnetz, Gateway und DNS1 Pflicht. Subnetz als 255.255.255.0 oder 24.",
+        "Die Eingabefelder bleiben bei Umschaltungen unverändert.",
+        "„Einstellungen zurücksetzen“ stellt die ursprüngliche Konfiguration wieder her, die beim Start des Programms geladen wurde.",
+    ]:
+        tk.Label(
+            right_col,
+            text=hint_line,
+            font=("Segoe UI", 9),
+            fg="#666666",
+            bg="white",
+            justify="left",
+            anchor="w",
+            wraplength=820,
+        ).pack(anchor="w", padx=15, pady=(0, 2))
+    tk.Frame(right_col, bg="white", height=6).pack()
+
+    entries = {}
+
+    ext_list = net.get("extended_list", [])
+    ext_ips = [ip for ip, _ in ext_list]
+    ext_subnets = [prefix_to_mask(prefix) for _, prefix in ext_list]
+
+    def make_ip_row(label, keys, widths):
+        frame = tk.Frame(right_col, bg="white")
+        frame.pack(fill="x", padx=15, pady=7)
+        tk.Label(frame, text=label + ":", width=12, anchor="w",
+                 bg="white", fg="#444444").pack(side="left")
+        for key, w in zip(keys, widths):
+            e = tk.Entry(frame, width=w, font=("Segoe UI", 10), bg="white", relief="solid", bd=1)
+            e.pack(side="left", padx=4)
+            entries[key] = e
+
+    def open_iface_properties(name):
+        if name in ("Keine Verbindung", ""):
+            os.startfile("ncpa.cpl")
+            return
+        ps = (
+            'Add-Type -AssemblyName System.Windows.Forms\n'
+            '$s = New-Object -ComObject Shell.Application\n'
+            '$n = $s.NameSpace("shell:::{7007ACC7-3202-11D1-AAD2-00805FC1270E}")\n'
+            '$i = $n.Items() | Where-Object { $_.Name -eq "' + name + '" }\n'
+            'if ($i) {\n'
+            '    $i.InvokeVerb("properties")\n'
+                '    Start-Sleep -Milliseconds 1500\n'
+            '    [System.Windows.Forms.SendKeys]::SendWait("i")\n'
+            '    Start-Sleep -Milliseconds 300\n'
+            '    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")\n'
+            '    Start-Sleep -Milliseconds 200\n'
+            '    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")\n'
+            '    Start-Sleep -Milliseconds 200\n'
+            '    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")\n'
+            '}\n'
+            'while ($true) {\n'
+            '    [System.Windows.Forms.Application]::DoEvents()\n'
+            '    Start-Sleep -Milliseconds 100\n'
+            '}\n'
+        )
+        ps_path = os.path.join(os.environ.get("TEMP", "."), "kdtool_open_props.ps1")
+        try:
+            with open(ps_path, "w") as f:
+                f.write(ps)
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                 "-ExecutionPolicy", "Bypass", "-File", ps_path]
+            )
+        except Exception:
+            os.startfile("ncpa.cpl")
+
+    ip_frame = tk.Frame(right_col, bg="white")
+    ip_frame.pack(fill="x", padx=15, pady=7)
+    tk.Label(ip_frame, text="IP:", width=12, anchor="w",
+             bg="white", fg="#444444").pack(side="left")
+    for key, w in zip(["IP", "IP_EXT1", "IP_EXT2"], [15, 15, 15]):
+        e = tk.Entry(ip_frame, width=w, font=("Segoe UI", 10), bg="white", relief="solid", bd=1)
+        e.pack(side="left", padx=4)
+        entries[key] = e
+    tk.Button(ip_frame, text="Netzwerkeinstellungen öffnen", font=("Segoe UI", 8),
+              bg="#0078d4", fg="white", relief="flat", cursor="hand2",
+              command=lambda: open_iface_properties(net["iface"])).pack(side="left", padx=(10, 0))
+
+    make_ip_row("Subnetz", ["Subnetz", "Subnetz_EXT1", "Subnetz_EXT2"], [15, 15, 15])
+    make_ip_row("Gateway", ["Gateway"], [15])
+    make_ip_row("DNS1", ["DNS1"], [15])
+    make_ip_row("DNS2", ["DNS2"], [15])
+
+    if net["ip"] == "Keine Verbindung":
+        entry_values = {"ip": "", "subnet": "", "gateway": "", "dns1": "", "dns2": ""}
+        ext_ip_vals = ["", ""]
+        ext_sub_vals = ["", ""]
+    else:
+        entry_values = net
+        ext_ip_vals = [ext_ips[i] if i < len(ext_ips) else "" for i in range(2)]
+        ext_sub_vals = [ext_subnets[i] if i < len(ext_subnets) else "" for i in range(2)]
+
+    entries["IP"].insert(0, entry_values["ip"])
+    entries["Subnetz"].insert(0, entry_values["subnet"])
+    entries["Gateway"].insert(0, entry_values["gateway"])
+    entries["DNS1"].insert(0, entry_values["dns1"])
+    entries["DNS2"].insert(0, entry_values["dns2"])
+    entries["IP_EXT1"].insert(0, ext_ip_vals[0])
+    entries["IP_EXT2"].insert(0, ext_ip_vals[1])
+    entries["Subnetz_EXT1"].insert(0, ext_sub_vals[0])
+    entries["Subnetz_EXT2"].insert(0, ext_sub_vals[1])
+
+    try:
+        save_network_backup(entries, dhcp == "Ja")
+    except OSError:
+        pass
+
+    btn_frame = tk.Frame(right_col, bg="white")
+    btn_frame.pack(anchor="w", padx=15, pady=10)
+
+    status_frame = tk.Frame(right_col, bg="white", height=200)
+    status_frame.pack(fill="x", padx=15, pady=(5, 12))
+    status_frame.pack_propagate(False)
+
+    status_label = tk.Label(
+        status_frame,
+        text="",
+        bg="white",
+        font=("Segoe UI", 11),
+        fg="#333333",
+        justify="left",
+        anchor="nw",
+        wraplength=900,
+    )
+    status_label.pack(fill="x")
+
+    def show_status(message):
+        if message.startswith("❌"):
+            color = "#d32f2f"
+        elif message.startswith("✅"):
+            color = "#28a745"
+        else:
+            color = "#333333"
+        status_label.config(text=message, fg=color)
+
+    btn_state = "normal" if password_ok else "disabled"
+
+    btn_dhcp = tk.Button(
+        btn_frame,
+        text="zu DHCP umschalten",
+        bg="#d32f2f",
+        fg="white",
+        font=("Segoe UI", 11, "bold"),
+        width=17,
+        height=1,
+        relief="flat",
+        state=btn_state,
+    )
+    btn_dhcp.pack(side="left", padx=(0, 10))
+
+    btn_static = tk.Button(
+        btn_frame,
+        text="Fixe IP setzen",
+        bg="#0078d4",
+        fg="white",
+        font=("Segoe UI", 11, "bold"),
+        width=17,
+        height=1,
+        relief="flat",
+        state=btn_state,
+    )
+    btn_static.pack(side="left", padx=(0, 10))
+
+    btn_restore = tk.Button(
+        btn_frame,
+        text="Zurücksetzen",
+        bg="#6c757d",
+        fg="white",
+        font=("Segoe UI", 11, "bold"),
+        width=17,
+        height=1,
+        relief="flat",
+        state=btn_state,
+    )
+    btn_restore.pack(side="left")
+
+    status_label.pack(anchor="w", padx=15, pady=(5, 12))
+
+    _set_firewall_labels(firewall)
+    root.update()
 
     t2 = ttk.Frame(tabs)
 
@@ -2383,7 +2750,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
 
     add_section_title(t2, "Benutzer", top_padding=20)
     users_frame = tk.Frame(t2, bg="white")
-    users_frame.pack(fill="x", padx=30, pady=(0, 5))
+    users_frame.pack(fill="x", padx=15, pady=(0, 5))
     refresh_windows_data()
 
     def create_user01():
@@ -2409,7 +2776,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
             user_status_label.config(text="❌ Fehler beim Anlegen des Benutzers.", fg="#d32f2f")
 
     btn_user_frame = tk.Frame(t2, bg="white")
-    btn_user_frame.pack(fill="x", padx=30, pady=(5, 10))
+    btn_user_frame.pack(fill="x", padx=15, pady=(5, 10))
     tk.Button(
         btn_user_frame, text="Benutzer User01 anlegen", command=create_user01,
         bg="#0078d4", fg="white", font=("Segoe UI", 11, "bold"),
@@ -2420,7 +2787,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
         t2, text="", bg="white", font=("Segoe UI", 11),
         fg="#333333", justify="left", anchor="w", wraplength=900,
     )
-    user_status_label.pack(fill="x", padx=30, pady=(0, 10))
+    user_status_label.pack(fill="x", padx=15, pady=(0, 5))
 
     t3 = ttk.Frame(tabs)
 
@@ -2466,7 +2833,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
     tree.heading("Name", text="Druckername")
     tree.heading("IP", text="IP / Port")
     tree.heading("Jobs", text="Druckaufträge")
-    tree.heading("Fehler", text="Fehler")
+    tree.heading("Fehler", text="OK / Fehler")
     tree.column("Jobs", width=100, anchor="center")
     tree.column("Fehler", width=80, anchor="center")
     tree.tag_configure("fehler", background="#FFE0B2")
@@ -2524,7 +2891,7 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
 
     t4 = tk.Frame(tabs, bg="white")
     header = tk.Frame(t4, bg="white")
-    header.pack(fill="x", padx=30, pady=(20, 5))
+    header.pack(fill="x", padx=15, pady=(8, 3))
     tk.Label(header, text="Netzwerkgeräte", font=("Segoe UI", 13, "bold"), fg="#0078d4", bg="white"
              ).pack(side="left")
     tk.Button(header, text="↻ Aktualisieren", font=("Segoe UI", 9), bg="#0078d4", fg="white",
@@ -2543,14 +2910,13 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
     vlan_progress_bar = ttk.Progressbar(
         vlan_progress_frame,
         style="vlan.Horizontal.TProgressbar",
-        mode="determinate",
-        maximum=100,
+        mode="indeterminate",
     )
     vlan_progress_bar.pack(fill="x", pady=(3, 0))
     ttk.Style().configure("vlan.Horizontal.TProgressbar", background="#0078d4")
 
     vlan_content_frame = tk.Frame(t4, bg="white")
-    vlan_content_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+    vlan_content_frame.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
     vlan_left_frame = tk.Frame(vlan_content_frame, bg="white")
     vlan_left_frame.pack(side="left", fill="both", expand=True)
@@ -2558,24 +2924,27 @@ def start_gui(root, net, dhcp, printers, internet, windows, kasse_version, kasse
     vlan_primary_frame = tk.LabelFrame(vlan_left_frame, text="Hauptnetzwerk", bg="white", padx=5, pady=5)
     vlan_primary_frame.pack(fill="both", expand=True, pady=(0, 5))
 
-    tree2_primary = ttk.Treeview(vlan_primary_frame, columns=("IP", "Name", "MAC"), show="headings", height=8)
+    tree2_primary = ttk.Treeview(vlan_primary_frame, columns=("IP", "Name", "MAC", "Hersteller"), show="headings", height=5)
     tree2_primary.heading("IP", text="IP-Adresse")
-    tree2_primary.heading("Name", text="Name / Hersteller")
+    tree2_primary.heading("Name", text="Name")
     tree2_primary.heading("MAC", text="MAC-Adresse")
-    tree2_primary.column("IP", width=160, anchor="w")
-    tree2_primary.column("Name", width=320, anchor="w")
-    tree2_primary.column("MAC", width=180, anchor="w")
+    tree2_primary.heading("Hersteller", text="Hersteller")
+    tree2_primary.column("IP", width=140, anchor="w")
+    tree2_primary.column("Name", width=200, anchor="w")
+    tree2_primary.column("MAC", width=150, anchor="w")
+    tree2_primary.column("Hersteller", width=250, anchor="w")
     tree2_primary.pack(fill="both", expand=True, padx=5, pady=5)
 
     vlan_extended_frame = tk.LabelFrame(vlan_left_frame, text="Erweiterte Netzwerke", bg="white", padx=5, pady=5)
-
-    tree2_extended = ttk.Treeview(vlan_extended_frame, columns=("IP", "Name", "MAC"), show="headings", height=5)
+    tree2_extended = ttk.Treeview(vlan_extended_frame, columns=("IP", "Name", "MAC", "Hersteller"), show="headings", height=5)
     tree2_extended.heading("IP", text="IP-Adresse")
-    tree2_extended.heading("Name", text="Name / Hersteller")
+    tree2_extended.heading("Name", text="Name")
     tree2_extended.heading("MAC", text="MAC-Adresse")
-    tree2_extended.column("IP", width=160, anchor="w")
-    tree2_extended.column("Name", width=320, anchor="w")
-    tree2_extended.column("MAC", width=180, anchor="w")
+    tree2_extended.heading("Hersteller", text="Hersteller")
+    tree2_extended.column("IP", width=140, anchor="w")
+    tree2_extended.column("Name", width=200, anchor="w")
+    tree2_extended.column("MAC", width=150, anchor="w")
+    tree2_extended.column("Hersteller", width=250, anchor="w")
     tree2_extended.pack(fill="both", expand=True, padx=5, pady=5)
 
     if net.get("extended_list"):
@@ -2603,19 +2972,26 @@ Start-Sleep -Seconds 2.5
         subprocess.Popen(["powershell", "-NoProfile", "-Command", ps],
                          creationflags=subprocess.CREATE_NO_WINDOW)
 
+    def _copy_ip(ip):
+        root.clipboard_clear()
+        root.clipboard_append(ip)
+        messagebox.showinfo("Zwischenablage", f"IP-Adresse {ip} wurde kopiert.")
+
     def show_row_menu(event):
         tree = event.widget
         item = tree.identify_row(event.y)
         if not item:
             return
         values = tree.item(item, "values")
-        if not values or len(values) < 3:
+        if not values or len(values) < 4:
             return
         ip = values[0]
         mac = values[2].strip()
         menu = tk.Menu(root, tearoff=0)
         if is_ipv4_address(ip):
-            menu.add_command(label=f"Ping ({ip})", command=lambda ip=ip: _show_ping(ip))
+            menu.add_command(label=f"Ping ({ip})", command=lambda i=ip: _show_ping(i))
+            menu.add_command(label=f"IP-Adresse kopieren ({ip})",
+                             command=lambda i=ip: _copy_ip(i))
         if mac and re.match(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$", mac):
             menu.add_command(label=f"MAC-Adresse kopieren ({mac})",
                              command=lambda m=mac: _copy_mac(m))
@@ -2736,14 +3112,35 @@ Start-Sleep -Seconds 2.5
         load_vlan(
             tree2_primary, tree2_extended, root, _cur_net["ip"], _cur_net.get("extended_list", []),
             progress_label=vlan_progress_label, progress_bar=vlan_progress_bar,
-            on_scan_done=on_scan_done,
+            on_scan_done=on_scan_done, nmap_ok=nmap_ok,
         )
 
-    load_vlan(
-        tree2_primary, tree2_extended, root, _cur_net["ip"], _cur_net.get("extended_list", []),
-        progress_label=vlan_progress_label, progress_bar=vlan_progress_bar,
-        on_scan_done=on_scan_done,
-    )
+    global _vlan_scan_cache
+    if _vlan_scan_cache is not None:
+        own_ip = _vlan_scan_cache["own_ip"]
+        for ip_addr, name, mac, vendor in _vlan_scan_cache["primary"]:
+            tag = ("own",) if ip_addr == own_ip else ()
+            tree2_primary.insert("", "end", values=(ip_addr, name, mac, vendor), tags=tag)
+        for ip_addr, name, mac, vendor in _vlan_scan_cache["extended"]:
+            tag = ("own",) if ip_addr == own_ip else ()
+            tree2_extended.insert("", "end", values=(ip_addr, name, mac, vendor), tags=tag)
+        tree2_primary.tag_configure("own", background="#FFE0B2")
+        tree2_extended.tag_configure("own", background="#FFE0B2")
+        total = len(_vlan_scan_cache["primary"]) + len(_vlan_scan_cache["extended"])
+        vlan_progress_label.config(text=f"Scan abgeschlossen. {total} Geräte gefunden.")
+        vlan_progress_bar.stop()
+        vlan_progress_bar.config(mode="determinate", maximum=100, value=100)
+        if _cur_net.get("extended_list"):
+            vlan_extended_frame.pack(fill="both", expand=True, pady=(5, 0))
+        else:
+            vlan_extended_frame.pack_forget()
+        on_scan_done()
+    else:
+        load_vlan(
+            tree2_primary, tree2_extended, root, _cur_net["ip"], _cur_net.get("extended_list", []),
+            progress_label=vlan_progress_label, progress_bar=vlan_progress_bar,
+            on_scan_done=on_scan_done, nmap_ok=nmap_ok,
+        )
 
     ip_renew_bottom = tk.Frame(t4, bg="white")
     ip_renew_bottom.pack(fill="x", padx=20, pady=(5, 10))
@@ -2846,7 +3243,9 @@ Start-Sleep -Seconds 2.5
         ws_label.config(text=new_ws)
         _cur_kasse_ordner = new_ordner
         _cur_kasse_ws[0] = new_ws
-        new_firma, _ = extract_firma_data(new_ordner)
+        new_firma, _ = extract_firma_data_db()
+        if not new_firma:
+            new_firma, _ = extract_firma_data(new_ordner)
         _cur_kasse_firma_data = new_firma
         if new_firma:
             firma_labels["firma_name"].config(text=new_firma.get("fabetrieb", ""), fg="#000000")
@@ -2873,15 +3272,15 @@ Start-Sleep -Seconds 2.5
     ws_label = add_info_row(t5, "Arbeitsstationen", arbeitsstationen)
 
     kasse_data_sep = tk.Frame(t5, bg="#e0e0e0", height=1)
-    kasse_data_sep.pack(fill="x", padx=30, pady=15)
+    kasse_data_sep.pack(fill="x", padx=15, pady=8)
 
     tk.Label(t5, text="Firma", font=("Segoe UI", 11, "bold"),
-             fg="#0078d4", bg="white").pack(anchor="w", padx=30, pady=(0, 2))
+             fg="#0078d4", bg="white").pack(anchor="w", padx=15, pady=(0, 2))
 
     firma_labels = {}
     for k, lbl in [("firma_name", "Name"), ("firma_strasse", "Strasse"), ("firma_plzort", "PLZ/Ort")]:
         row = tk.Frame(t5, bg="white")
-        row.pack(fill="x", padx=30, pady=2)
+        row.pack(fill="x", padx=15, pady=2)
         tk.Label(row, text=f"{lbl}:", width=12, anchor="w", bg="white", fg="#444444",
                  font=("Segoe UI", 10)).pack(side="left")
         txt = ""
@@ -2900,12 +3299,12 @@ Start-Sleep -Seconds 2.5
         firma_labels[k] = val
 
     tk.Label(t5, text="Betriebsstätte", font=("Segoe UI", 11, "bold"),
-             fg="#0078d4", bg="white").pack(anchor="w", padx=30, pady=(12, 2))
+             fg="#0078d4", bg="white").pack(anchor="w", padx=15, pady=(6, 2))
 
     bs_labels = {}
     for k, lbl in [("bs_name", "Name"), ("bs_adresse", "Adresse"), ("bs_plzort", "PLZ/Ort")]:
         row = tk.Frame(t5, bg="white")
-        row.pack(fill="x", padx=30, pady=2)
+        row.pack(fill="x", padx=15, pady=2)
         tk.Label(row, text=f"{lbl}:", width=12, anchor="w", bg="white", fg="#444444",
                  font=("Segoe UI", 10)).pack(side="left")
         txt = ""
@@ -2924,7 +3323,7 @@ Start-Sleep -Seconds 2.5
         bs_labels[k] = val
 
     kasse_bottom = tk.Frame(t5, bg="white")
-    kasse_bottom.pack(side="bottom", fill="x", padx=30, pady=(15, 10))
+    kasse_bottom.pack(side="bottom", fill="x", padx=15, pady=(8, 5))
     kasse_right = tk.Frame(kasse_bottom, bg="white")
     kasse_right.pack(side="right")
     tk.Button(
@@ -3034,8 +3433,8 @@ Start-Sleep -Seconds 2.5
         height=1,
         relief="flat",
         command=on_open_teamviewer,
-    ).pack(anchor="w", padx=30, pady=10)
-    tv_status_label.pack(anchor="w", padx=30, pady=(0, 10))
+    ).pack(anchor="w", padx=15, pady=10)
+    tv_status_label.pack(anchor="w", padx=15, pady=(0, 5))
 
     add_section_title(t7, "AnyDesk", top_padding=20)
     ad_installed_label = add_info_row(t7, "Installiert", "Ja" if find_anydesk_exe() else "Nein", label_width=20,
@@ -3073,8 +3472,8 @@ Start-Sleep -Seconds 2.5
         height=1,
         relief="flat",
         command=on_open_anydesk,
-    ).pack(anchor="w", padx=30, pady=10)
-    ad_status_label.pack(anchor="w", padx=30, pady=(0, 10))
+    ).pack(anchor="w", padx=15, pady=10)
+    ad_status_label.pack(anchor="w", padx=15, pady=(0, 5))
 
     if password_ok:
         t_cleanup = tk.Frame(tabs, bg="white")
@@ -3130,7 +3529,7 @@ Start-Sleep -Seconds 2.5
         load_drives()
 
         middle_frame = tk.Frame(t_cleanup, bg="white")
-        middle_frame.pack(fill="x", padx=20, pady=(0, 10))
+        middle_frame.pack(fill="x", padx=20, pady=(0, 5))
 
         tasks_frame = tk.LabelFrame(middle_frame, text="Windows", bg="white", padx=5, pady=5)
         tasks_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
@@ -3174,7 +3573,7 @@ Start-Sleep -Seconds 2.5
                         command=on_kasse_select_all, bg="white").pack(anchor="w", padx=10, pady=5)
 
         kasse_tasks = [
-            ("kasse_1", "Punkt 1"),
+            ("kasse_1", "/Install/ löschen"),
             ("kasse_2", "Punkt 2"),
             ("kasse_3", "Punkt 3"),
             ("kasse_4", "Punkt 4"),
@@ -3196,12 +3595,12 @@ Start-Sleep -Seconds 2.5
         tk.Checkbutton(adobe_frame, text="Backup Maker deinstallieren", variable=bm_var, bg="white").pack(
             anchor="w", padx=10, pady=2)
 
-        output_text = tk.Text(t_cleanup, height=10, font=("Consolas", 9), bg="white", fg="#222222",
+        output_text = tk.Text(t_cleanup, height=5, font=("Consolas", 9), bg="white", fg="#222222",
                               relief="solid", bd=1, wrap="word")
-        output_text.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+        output_text.pack(fill="both", expand=True, padx=20, pady=(0, 3))
 
         task_status_label = tk.Label(t_cleanup, text="", font=("Segoe UI", 10), fg="#0078d4", bg="white", anchor="w")
-        task_status_label.pack(fill="x", padx=20, pady=(0, 5))
+        task_status_label.pack(fill="x", padx=20, pady=(0, 3))
 
         def append_output(msg):
             output_text.insert("end", msg + "\n")
@@ -3232,7 +3631,15 @@ Start-Sleep -Seconds 2.5
                 if "cleanmgr" in selected:
                     log(">>> Datenträgerbereinigung wird gestartet ...")
                     status("cleanmgr /lowdisk läuft ...")
-                    subprocess.run(["cleanmgr", "/lowdisk"], capture_output=True, **_subprocess_kwargs())
+                    clean_proc = subprocess.Popen(
+                        ["cleanmgr", "/lowdisk"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, encoding="utf-8", errors="ignore",
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    _monitor_windows(clean_proc, log)
+                    clean_proc.wait()
+                    log(">>> cleanmgr beendet.")
 
                 if "dism" in selected:
                     log(">>> DISM bereinigt alte Updates (dieser Vorgang kann mehrere Minuten dauern) ...")
@@ -3265,7 +3672,7 @@ Start-Sleep -Seconds 2.5
                     status("")
 
                 kasse_paths = {
-                    "kasse_1": "C:\\Windows\\Temp",
+                    "kasse_1": "C:\\X3000\\Install",
                     "kasse_2": "C:\\Windows\\Temp",
                     "kasse_3": "C:\\Windows\\Temp",
                     "kasse_4": "C:\\Windows\\Temp",
@@ -3275,11 +3682,18 @@ Start-Sleep -Seconds 2.5
                     d = kasse_paths[key]
                     log(f">>> {d} wird gelöscht ...")
                     status(f"Lösche {d} ...")
-                    subprocess.run(
-                        ["cmd", "/c", f'rd /s /q "{d}" 2>nul & mkdir "{d}" 2>nul'],
-                        **_subprocess_kwargs(),
-                    )
-                    log(f">>> {d} gelöscht.")
+                    if key == "kasse_1":
+                        try:
+                            shutil.rmtree(d, ignore_errors=True)
+                            log(f">>> {d} gelöscht.")
+                        except:
+                            log(f">>> Fehler beim Löschen von {d}")
+                    else:
+                        subprocess.run(
+                            ["cmd", "/c", f'rd /s /q "{d}" 2>nul & mkdir "{d}" 2>nul'],
+                            **_subprocess_kwargs(),
+                        )
+                        log(f">>> {d} gelöscht.")
                     status("")
 
                 if adobe_var.get():
@@ -3378,9 +3792,9 @@ Start-Sleep -Seconds 2.5
             font=("Segoe UI", 11, "bold"),
             relief="flat", padx=16, pady=6,
             command=run_cleanup,
-        ).pack(anchor="e", padx=20, pady=(5, 2))
+        ).pack(anchor="e", padx=20, pady=(3, 2))
         cleanup_status = tk.Label(t_cleanup, text="", font=("Segoe UI", 10), bg="white", anchor="e")
-        cleanup_status.pack(anchor="e", padx=20, pady=(0, 10))
+        cleanup_status.pack(anchor="e", padx=20, pady=(0, 5))
 
     # ====================== ZUSATZFUNKTIONEN ======================
     t_zusatz = tk.Frame(tabs, bg="white")
@@ -3388,7 +3802,7 @@ Start-Sleep -Seconds 2.5
     add_section_title(t_zusatz, "Zweitkasse vorbereiten", top_padding=20)
 
     row = tk.Frame(t_zusatz, bg="white")
-    row.pack(fill="x", padx=30, pady=10)
+    row.pack(fill="x", padx=15, pady=10)
     tk.Label(row, text="Hauptkasse:", width=16, anchor="w", bg="white", fg="#444444",
              font=("Segoe UI", 10)).pack(side="left")
     server_entry = tk.Entry(row, width=40, font=("Segoe UI", 10), bg="white", relief="solid", bd=1)
@@ -3398,7 +3812,7 @@ Start-Sleep -Seconds 2.5
              font=("Segoe UI", 10, "italic")).pack(side="left", padx=4)
 
     info_frame = tk.Frame(t_zusatz, bg="white")
-    info_frame.pack(fill="x", padx=30, pady=5)
+    info_frame.pack(fill="x", padx=15, pady=5)
     for text in [
         "➤ Ändert die Server-Adresse in der param.ini gemäss Textfeld",
         "➤ Löscht das Install-Verzeichnis (C:\\X3000\\Install)",
@@ -3411,10 +3825,10 @@ Start-Sleep -Seconds 2.5
 
     warn_label = tk.Label(t_zusatz, text="Willst du das wirklich? (Diese Aktion kann nicht rückgängig gemacht werden!)",
                            font=("Segoe UI", 10, "bold"), fg="#d32f2f", bg="white", anchor="w")
-    warn_label.pack(fill="x", padx=30, pady=(15, 5))
+    warn_label.pack(fill="x", padx=15, pady=(8, 3))
 
     confirm_row = tk.Frame(t_zusatz, bg="white")
-    confirm_row.pack(fill="x", padx=30, pady=(0, 10))
+    confirm_row.pack(fill="x", padx=15, pady=(0, 5))
     tk.Label(confirm_row, text="Zum Bestätigen «ja» eingeben:", width=28, anchor="w", bg="white", fg="#444444",
              font=("Segoe UI", 10)).pack(side="left")
     confirm_entry = tk.Entry(confirm_row, width=15, font=("Segoe UI", 10), bg="white", relief="solid", bd=1)
@@ -3614,9 +4028,9 @@ Start-Sleep -Seconds 2.5
         width=32, height=1,
         relief="flat",
         command=run_zusatz,
-    ).pack(anchor="w", padx=30, pady=(5, 5))
+    ).pack(anchor="w", padx=15, pady=(5, 5))
 
-    zusatz_status.pack(fill="x", padx=30, pady=(0, 5))
+    zusatz_status.pack(fill="x", padx=15, pady=(0, 5))
 
     # ====================== DATEN ÜBERMITTELN ======================
     t8 = tk.Frame(tabs, bg="white")
@@ -3636,7 +4050,7 @@ Start-Sleep -Seconds 2.5
 
     def add_email_row(parent, label, show=None, width=60, default=""):
         row = tk.Frame(parent, bg="white")
-        row.pack(fill="x", padx=30, pady=5)
+        row.pack(fill="x", padx=15, pady=5)
         tk.Label(row, text=label, width=16, anchor="w", bg="white", fg="#444444",
                  font=("Segoe UI", 10)).pack(side="left")
         e = tk.Entry(row, width=width, font=("Segoe UI", 10), bg="white", relief="solid", bd=1, show=show)
@@ -3647,7 +4061,9 @@ Start-Sleep -Seconds 2.5
 
     def _refresh_email_subject():
         email_status.config(text="", fg="#333333")
-        new_firma, _ = extract_firma_data(_cur_kasse_ordner)
+        new_firma, _ = extract_firma_data_db()
+        if not new_firma:
+            new_firma, _ = extract_firma_data(_cur_kasse_ordner)
         pc_name = platform.node()
         datum = datetime.now().strftime('%d.%m.%Y')
         f_parts = ""
@@ -3698,7 +4114,7 @@ Start-Sleep -Seconds 2.5
                 break
 
     cb_row = tk.Frame(scroll_frame, bg="white")
-    cb_row.pack(fill="x", padx=30, pady=5)
+    cb_row.pack(fill="x", padx=15, pady=5)
     tk.Label(cb_row, text="Empfänger wählen", width=16, anchor="w", bg="white", fg="#444444",
              font=("Segoe UI", 10)).pack(side="left")
     cb_display = [name for name, _ in email_recipients]
@@ -3725,7 +4141,7 @@ Start-Sleep -Seconds 2.5
         smtp_subject.insert(0, new_subject)
 
     attach_frame = tk.Frame(scroll_frame, bg="white")
-    attach_frame.pack(fill="x", padx=30, pady=(10, 5))
+    attach_frame.pack(fill="x", padx=15, pady=(5, 3))
     tk.Label(attach_frame, text="Anhänge", width=16, font=("Segoe UI", 10), fg="#444444", bg="white",
              anchor="w").pack(side="left")
     sys_info_var = tk.BooleanVar(value=False)
@@ -3742,7 +4158,7 @@ Start-Sleep -Seconds 2.5
         smtp_from = add_email_row(scroll_frame, "Absender", default="mailservice@keller-duerr.ch")
 
         enc_row = tk.Frame(scroll_frame, bg="white")
-        enc_row.pack(fill="x", padx=30, pady=5)
+        enc_row.pack(fill="x", padx=15, pady=5)
         tk.Label(enc_row, text="Verschlüsselung", width=16, anchor="w", bg="white", fg="#444444",
                  font=("Segoe UI", 10)).pack(side="left")
         enc_var = tk.StringVar(value="ssl")
@@ -3845,8 +4261,8 @@ Start-Sleep -Seconds 2.5
     btn_email = tk.Button(scroll_frame, text="E-Mail senden", bg="#0078d4", fg="white",
               font=("Segoe UI", 11, "bold"), width=22, height=1, state="disabled",
               relief="flat", command=send_email)
-    btn_email.pack(anchor="w", padx=30, pady=(10, 2))
-    email_status.pack(anchor="w", padx=30, pady=(0, 5))
+    btn_email.pack(anchor="w", padx=15, pady=(6, 2))
+    email_status.pack(anchor="w", padx=15, pady=(0, 5))
 
     tk.Frame(scroll_frame, bg="white", height=15).pack()
 
@@ -3951,20 +4367,20 @@ Start-Sleep -Seconds 2.5
         relief="flat",
         command=on_create_text,
     )
-    btn_text.pack(anchor="w", padx=30, pady=10)
-    text_status_label.pack(anchor="w", padx=30, pady=(0, 10))
+    btn_text.pack(anchor="w", padx=15, pady=6)
+    text_status_label.pack(anchor="w", padx=15, pady=(0, 5))
 
     # ====================== INFO ======================
     t_info = ttk.Frame(tabs)
 
     info_main = tk.Frame(t_info, bg="white")
-    info_main.pack(fill="both", expand=True, padx=30, pady=25)
+    info_main.pack(fill="both", expand=True, padx=15, pady=12)
 
     left_col = tk.Frame(info_main, bg="white")
     left_col.pack(fill="both", expand=True)
 
     tk.Label(left_col, text="KDtool - Keller & Dürr Kassensysteme AG",
-             font=("Segoe UI", 14, "bold"), fg="#0078d4", bg="white").pack(anchor="w", pady=(0, 12))
+             font=("Segoe UI", 14, "bold"), fg="#0078d4", bg="white").pack(anchor="w", pady=(0, 6))
 
     for line in ("Wegenstrasse 4a", "CH-9436 Balgach", "Schweiz"):
         tk.Label(left_col, text=line, font=("Segoe UI", 10), fg="#333333", bg="white").pack(anchor="w")
@@ -4176,13 +4592,69 @@ Start-Sleep -Seconds 2.5
     _add_tab(t5, text="Kasse")
     _add_tab(t8, text="Daten übermitteln")
     _add_tab(t_info, text="Info")
+
     if password_ok:
-        _add_tab(t_cleanup, text="Datenträgerbereinigung")
-        _add_tab(t_zusatz, text="Zusatzfunktionen")
+        _sub_tab_names = []
+        _sub_tab_refs = []
+        _kd_expanded = [False]
+
+        def _add_sub_tab(page, text):
+            _add_tab(page, text=text)
+            btn = _tab_buttons[text]
+            btn.grid_remove()
+            # Button in der Dropdown-Leiste erstellen
+            sub_btn = tk.Button(
+                kd_sub_bar, text=text, relief="raised", bd=2, cursor="hand2",
+                bg=_get_tab_color(text), fg="#333333",
+                font=("Segoe UI", 9, "bold"), padx=12, pady=6,
+                command=lambda t=text: _switch_sub_tab(t),
+            )
+            sub_btn.pack(side="left", padx=1)
+            _sub_tab_names.append(text)
+            _sub_tab_refs.append(sub_btn)
+
+        def _switch_sub_tab(text):
+            _switch_tab(text)
+            # Dropdown wieder einklappen
+            _kd_expanded[0] = False
+            _kd_btn.config(bg="#0078d4", text="▼ K&D")
+            kd_sub_bar.place_forget()
+
+        def _toggle_kd():
+            _kd_expanded[0] = not _kd_expanded[0]
+            _kd_btn.config(bg="#005a9e" if _kd_expanded[0] else "#0078d4")
+            _kd_btn.config(text="▲ K&D" if _kd_expanded[0] else "▼ K&D")
+            if _kd_expanded[0]:
+                root.update_idletasks()
+                tab_h = tab_bar.winfo_height()
+                kd_sub_bar.place(
+                    x=6,
+                    y=tab_h + 3,
+                    width=root.winfo_width() - 12,
+                    anchor="nw",
+                )
+                kd_sub_bar.lift()
+                for sub_btn in _sub_tab_refs:
+                    idx = _sub_tab_refs.index(sub_btn)
+                    name = _sub_tab_names[idx]
+                    sub_btn.config(bg=_get_tab_color(name))
+            else:
+                kd_sub_bar.place_forget()
+
+        _kd_btn = tk.Button(
+            tab_bar, text="▼ K&D", relief="raised", bd=2, cursor="hand2",
+            bg="#0078d4", fg="white",
+            font=("Segoe UI", 9, "bold"), padx=12, pady=8,
+            command=_toggle_kd,
+        )
+        _kd_btn.grid(row=0, column=_tab_col[0], sticky="s", padx=1)
+        _tab_col[0] += 1
+
+        _add_sub_tab(t_cleanup, text="Datenträgerbereinigung")
+        _add_sub_tab(t_zusatz, text="Zusatzfunktionen")
 
         # ====================== HOSTS ======================
         t_hosts = ttk.Frame(tabs)
-        _add_tab(t_hosts, text="Hosts")
         hosts_path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"),
                                   "System32", "drivers", "etc", "hosts")
 
@@ -4219,7 +4691,7 @@ Start-Sleep -Seconds 2.5
                   state="normal" if is_admin() else "disabled",
                   command=save_hosts).pack(anchor="e", padx=20, pady=(10, 2))
         hosts_status = tk.Label(t_hosts, text="", font=("Segoe UI", 10), bg="white", anchor="e")
-        hosts_status.pack(anchor="e", padx=20, pady=(0, 10))
+        hosts_status.pack(anchor="e", padx=20, pady=(0, 5))
 
     _update_tab_colors()
 
@@ -4263,8 +4735,15 @@ Start-Sleep -Seconds 2.5
         slide_out(root, on_done=root.destroy)
 
     root.protocol("WM_DELETE_WINDOW", on_closing)
-    slide_in(root, 1380, 1000)
-    set_titlebar_style(root)
+    if splash:
+        def _on_splash_gone():
+            try: splash.destroy()
+            except: pass
+            root.after(200, lambda: (slide_in(root, 1024, 700), set_titlebar_style(root)))
+        slide_out(splash, speed=120, interval=5, on_done=_on_splash_gone)
+    else:
+        slide_in(root, 1024, 700)
+        set_titlebar_style(root)
 
     update_status_bar = tk.Label(bottom_bar, text="", font=("Segoe UI", 9, "bold"), fg="#555555", bg="white")
     update_status_bar.pack(side="right", padx=10)
